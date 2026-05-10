@@ -83,7 +83,7 @@ describe("HttpClient", () => {
       apiBaseURL: "http://test",
       fetchChatToken: fetchToken,
       fetchImpl: makeFetch({
-        "GET /api/chat/blocks": (req) => {
+        "GET /blocks": (req) => {
           seen.push(req.headers.get("authorization") ?? "");
           return new Response(JSON.stringify({ blocked: [] }), {
             status: 200,
@@ -101,7 +101,7 @@ describe("HttpClient", () => {
       apiBaseURL: "http://test",
       fetchChatToken: async () => fakeMint(),
       fetchImpl: makeFetch({
-        "POST /api/chat/blocks": () =>
+        "POST /blocks": () =>
           new Response(JSON.stringify({ error: "self_block", message: "cannot block self" }), {
             status: 400,
             headers: { "content-type": "application/json" },
@@ -115,7 +115,7 @@ describe("HttpClient", () => {
     });
   });
 
-  it("calls each /api/chat/* path with the right method + body shape", async () => {
+  it("calls each /* path with the right method + body shape", async () => {
     const calls: Array<{ method: string; path: string; body?: unknown }> = [];
     const recordHandler = (status = 200, resp: unknown = { ok: true }) =>
       async (req: Request) => {
@@ -134,16 +134,16 @@ describe("HttpClient", () => {
       apiBaseURL: "http://test",
       fetchChatToken: async () => fakeMint(),
       fetchImpl: makeFetch({
-        "POST /api/chat/keys/upload": recordHandler(),
-        "POST /api/chat/keys/topup": recordHandler(200, { ok: true, currentCount: 5 }),
-        "GET /api/chat/keys/count": recordHandler(200, { count: 3 }),
-        "POST /api/chat/keys/claim_all": recordHandler(200, { devices: [] }),
-        "GET /api/chat/keys/list_devices": recordHandler(200, { devices: [] }),
-        "GET /api/chat/envelopes/pending": recordHandler(200, { envelopes: [] }),
-        "POST /api/chat/envelopes/ack": recordHandler(200, { ok: true, deletedCount: 0 }),
-        "POST /api/chat/blocks": recordHandler(),
-        "DELETE /api/chat/blocks/bob": recordHandler(),
-        "GET /api/chat/blocks": recordHandler(200, { blocked: [] }),
+        "POST /keys/upload": recordHandler(),
+        "POST /keys/topup": recordHandler(200, { ok: true, currentCount: 5 }),
+        "GET /keys/count": recordHandler(200, { count: 3 }),
+        "POST /keys/claim_all": recordHandler(200, { devices: [] }),
+        "GET /keys/list_devices": recordHandler(200, { devices: [] }),
+        "GET /envelopes/pending": recordHandler(200, { envelopes: [] }),
+        "POST /envelopes/ack": recordHandler(200, { ok: true, deletedCount: 0 }),
+        "POST /blocks": recordHandler(),
+        "DELETE /blocks/bob": recordHandler(),
+        "GET /blocks": recordHandler(200, { blocked: [] }),
       }),
     });
 
@@ -168,16 +168,16 @@ describe("HttpClient", () => {
     await client.listBlocked("dev1");
 
     expect(calls.map((c) => `${c.method} ${c.path}`)).toEqual([
-      "POST /api/chat/keys/upload",
-      "POST /api/chat/keys/topup",
-      "GET /api/chat/keys/count",
-      "POST /api/chat/keys/claim_all",
-      "GET /api/chat/keys/list_devices",
-      "GET /api/chat/envelopes/pending",
-      "POST /api/chat/envelopes/ack",
-      "POST /api/chat/blocks",
-      "DELETE /api/chat/blocks/bob",
-      "GET /api/chat/blocks",
+      "POST /keys/upload",
+      "POST /keys/topup",
+      "GET /keys/count",
+      "POST /keys/claim_all",
+      "GET /keys/list_devices",
+      "GET /envelopes/pending",
+      "POST /envelopes/ack",
+      "POST /blocks",
+      "DELETE /blocks/bob",
+      "GET /blocks",
     ]);
     // ack carries deviceId + envelopeUuids
     expect(calls[6].body).toEqual({ deviceId: "dev1", envelopeUuids: ["env1"] });

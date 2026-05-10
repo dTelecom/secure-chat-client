@@ -53,8 +53,8 @@ afterEach(() => {
 // ── Fake fetch covering exactly what bootstrap + the preference path uses ──
 
 interface MockServerCalls {
-  blockPosts: string[]; // peerUserIds passed to POST /api/chat/blocks
-  blockDeletes: string[]; // peerUserIds passed to DELETE /api/chat/blocks/:peerUserId
+  blockPosts: string[]; // peerUserIds passed to POST /blocks
+  blockDeletes: string[]; // peerUserIds passed to DELETE /blocks/:peerUserId
   blocked: Set<string>;
 }
 
@@ -63,25 +63,25 @@ function makeMockFetch(calls?: MockServerCalls): typeof fetch {
     const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
     const u = new URL(url);
     const method = (init?.method ?? "GET").toUpperCase();
-    if (u.pathname === "/api/chat/keys/upload") {
+    if (u.pathname === "/keys/upload") {
       return jsonOk({ ok: true });
     }
-    if (u.pathname === "/api/chat/keys/count") {
+    if (u.pathname === "/keys/count") {
       return jsonOk({ count: 100 });
     }
-    if (u.pathname === "/api/chat/blocks" && method === "POST") {
+    if (u.pathname === "/blocks" && method === "POST") {
       const body = JSON.parse((init?.body as string) ?? "{}") as { peerUserId: string };
       calls?.blockPosts.push(body.peerUserId);
       calls?.blocked.add(body.peerUserId);
       return jsonOk({ ok: true });
     }
-    if (u.pathname.startsWith("/api/chat/blocks/") && method === "DELETE") {
-      const peer = decodeURIComponent(u.pathname.slice("/api/chat/blocks/".length));
+    if (u.pathname.startsWith("/blocks/") && method === "DELETE") {
+      const peer = decodeURIComponent(u.pathname.slice("/blocks/".length));
       calls?.blockDeletes.push(peer);
       calls?.blocked.delete(peer);
       return jsonOk({ ok: true });
     }
-    if (u.pathname === "/api/chat/blocks" && method === "GET") {
+    if (u.pathname === "/blocks" && method === "GET") {
       return jsonOk({ blocked: Array.from(calls?.blocked ?? []) });
     }
     return new Response(JSON.stringify({ error: "not_implemented", path: u.pathname }), {
@@ -184,7 +184,7 @@ describe("DTelecomSecureChat — read-receipts preference", () => {
     // We can't observe the absence of a WS frame with the fake transport
     // (NeverConnectingWs.send is a no-op), but we CAN observe whether the
     // SDK reaches the encrypt path. Encrypt-for-peer would call claim_all
-    // → /api/chat/keys/claim_all on the mock fetch. The mock returns 501,
+    // → /keys/claim_all on the mock fetch. The mock returns 501,
     // which would surface as a thrown error from sendContent's encrypt
     // call. With gating ON, markRead returns early before encrypt — so
     // nothing throws.
@@ -264,7 +264,7 @@ describe("DTelecomSecureChat — block / unblock", () => {
     return { blockPosts: [], blockDeletes: [], blocked: new Set() };
   }
 
-  it("blockUser POSTs /api/chat/blocks with the peer id", async () => {
+  it("blockUser POSTs /blocks with the peer id", async () => {
     const calls = emptyCalls();
     const sdk = await connectAlice(new MemoryKVStore(), calls);
     await sdk.blockUser("bob");
@@ -273,7 +273,7 @@ describe("DTelecomSecureChat — block / unblock", () => {
     await sdk.disconnect();
   });
 
-  it("unblockUser DELETEs /api/chat/blocks/:peerId", async () => {
+  it("unblockUser DELETEs /blocks/:peerId", async () => {
     const calls = emptyCalls();
     const sdk = await connectAlice(new MemoryKVStore(), calls);
     await sdk.blockUser("bob");

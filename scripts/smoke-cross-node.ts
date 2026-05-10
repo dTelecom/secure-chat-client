@@ -79,7 +79,7 @@ async function pickTwoChatNodes(): Promise<[string, string]> {
 
 function makeFetchToken(userId: string) {
   return async (deviceId: string): Promise<MintTokenResponse> => {
-    const res = await fetch(`${API_BASE_URL}/api/chat/token`, {
+    const res = await fetch(`${API_BASE_URL}/token`, {
       method: "POST",
       headers: {
         "content-type": "application/json",

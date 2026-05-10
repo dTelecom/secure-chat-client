@@ -1,5 +1,5 @@
 // Wire-contract types. Single source of truth for everything the SDK sends or
-// receives over /api/chat/* (HTTP) and /chat/ws (WebSocket). Shapes mirror
+// receives over the secure-chat HTTP API (HTTP) and /chat/ws (WebSocket). Shapes mirror
 // chat-wire-contract.md exactly — keep in sync.
 
 // ── chat token ───────────────────────────────────────────────────────────────
@@ -16,7 +16,7 @@ export interface ChatTokenClaims {
   chatReceive: boolean;
 }
 
-// ── HTTP (POST /api/chat/token response) ────────────────────────────────────
+// ── HTTP (the token-mint endpoint response) ────────────────────────────────────
 
 export interface MintTokenResponse {
   chatToken: string;

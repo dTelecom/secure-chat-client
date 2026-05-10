@@ -82,7 +82,7 @@ const body = {
   did: "00000000-0000-0000-0000-000000000001",
   iat: now,
   exp: now + 86_400,
-  chatWebhookUrl: "https://test.dmeet.org/api/chat/envelopes",
+  chatWebhookUrl: "https://test.dmeet.org/envelopes",
   chatSend: true,
   chatReceive: true,
 };

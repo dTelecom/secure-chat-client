@@ -4,7 +4,9 @@ TypeScript SDK for end-to-end encrypted 1:1 chat over the dTelecom mesh. Olm via
 
 ## Status
 
-v0.1.0 — feature complete.
+v0.2.0 — feature complete.
+
+> **v0.2.0 breaking change vs v0.1.0:** `apiBaseURL` is now the FULL endpoint prefix (host + path), and the SDK appends bare relative paths (`/token`, `/keys/upload`, `/envelopes/pending`, etc.) instead of hardcoding `/api/chat/`. Update consumers from `apiBaseURL: "https://app.example"` → `apiBaseURL: "https://app.example/api/secure-chat"` (or wherever the backend mounts the API).
 
 - 96/96 unit + 2/2 browser + 18/18 integration smokes against the deployed dTelecom mesh on Solana devnet
 - vodozemac (Rust → WASM, our `@dtelecom/vodozemac-wasm` crate) — libolm-compatible wire format
@@ -25,11 +27,13 @@ npm install @dtelecom/secure-chat-client
 import { DTelecomSecureChat } from "@dtelecom/secure-chat-client";
 
 const chat = await DTelecomSecureChat.connect({
-  apiBaseURL: "https://your-tenant-backend.example",
+  // Full endpoint prefix — host + path. The SDK appends bare relative
+  // paths under it (e.g. /token, /keys/upload, /envelopes/pending).
+  apiBaseURL: "https://your-tenant-backend.example/api/secure-chat",
   fetchChatToken: async (deviceId) => {
     // Call your tenant backend; it should mint a chat-token JWT
     // signed with the tenant wallet (Ed25519 via Solana registry).
-    const r = await fetch("/api/chat/token", {
+    const r = await fetch("/api/secure-chat/token", {
       method: "POST",
       body: JSON.stringify({ deviceId }),
     });

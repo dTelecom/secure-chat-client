@@ -1,7 +1,7 @@
 // PeerDeviceCache — lightweight cache of peer device metadata, refreshed
 // lazily on chat-open and on-decrypt-failure. Distinct from SessionManager's
 // bundle cache: this just tracks "which devices does B currently have?"
-// without consuming OTKs (uses GET /api/chat/keys/list_devices).
+// without consuming OTKs (uses GET /keys/list_devices).
 //
 // Refresh triggers (per plan §17):
 //   - On first chat-open with a peer (no cache or stale cache)

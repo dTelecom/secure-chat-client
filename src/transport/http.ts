@@ -1,6 +1,13 @@
-// Typed HTTP client wrapping all /api/chat/* endpoints. Owns no auth state —
-// the caller passes a chat token (or a callback that fetches one). Mirrors
-// chat-wire-contract.md §2 exactly.
+// Typed HTTP client wrapping all secure-chat HTTP endpoints. Owns no auth
+// state — the caller passes a chat token (or a callback that fetches
+// one). Mirrors chat-wire-contract.md §2 exactly.
+//
+// Path policy: every endpoint is requested as `${apiBaseURL}${RELATIVE}`
+// where RELATIVE is bare (e.g. "/keys/upload"). The SDK does NOT
+// hardcode any prefix like "/api/chat" — the consumer composes the
+// full prefix in `apiBaseURL` (e.g. "https://app.example/api/secure-chat").
+// This lets backends mount the API under any path layout without
+// patching the SDK.
 
 import type {
   AckRequest,
@@ -17,13 +24,24 @@ import type {
 
 /**
  * Consumer-supplied callback that mints a chat token via the tenant backend.
- * Must return the full `POST /api/chat/token` response so the SDK can use the
+ * Must return the full token-mint response so the SDK can use the
  * server-discovered node URL (chatNodeWsUrl) — no Solana code on the client.
+ *
+ * The callback can implement `POST {apiBaseURL}/token` itself, OR call any
+ * tenant-specific endpoint (e.g. one that wraps Privy auth) — the SDK
+ * doesn't care, only the response shape matters.
  */
 export type FetchChatToken = (deviceId: string) => Promise<MintTokenResponse>;
 
 export interface HttpClientOptions {
-  /** Base URL of the dmeet-backend (or mock). e.g. "http://localhost:8787" */
+  /**
+   * Full endpoint prefix for the secure-chat HTTP API. Every request is
+   * issued as `${apiBaseURL}${RELATIVE_PATH}`. The consumer is responsible
+   * for the entire prefix — host AND path. Examples:
+   *   "https://app.example/api/secure-chat"
+   *   "http://localhost:8787"                   (mock with bare paths)
+   *   "https://api.tenant.dev/v3/dtelecom-chat" (any custom mount point)
+   */
   apiBaseURL: string;
   /** Function returning a valid chat token JWT. Called when the SDK needs auth. */
   fetchChatToken: FetchChatToken;
@@ -130,27 +148,27 @@ export class HttpClient {
     return (await res.json()) as T;
   }
 
-  // ── /api/chat/keys ─────────────────────────────────────────────────────────
+  // ── keys ───────────────────────────────────────────────────────────────────
 
   uploadKeyBundle(deviceId: string, body: KeyBundleUploadRequest): Promise<{ ok: true }> {
-    return this.authedJson("POST", "/api/chat/keys/upload", deviceId, body);
+    return this.authedJson("POST", "/keys/upload", deviceId, body);
   }
 
   topupOtks(deviceId: string, keys: OneTimeKey[]): Promise<{ ok: true; currentCount: number }> {
     const body: OtkTopupRequest = { deviceId: deviceId, oneTimeKeys: keys };
-    return this.authedJson("POST", "/api/chat/keys/topup", deviceId, body);
+    return this.authedJson("POST", "/keys/topup", deviceId, body);
   }
 
   otkCount(deviceId: string): Promise<OtkCountResponse> {
     return this.authedJson(
       "GET",
-      `/api/chat/keys/count?deviceId=${encodeURIComponent(deviceId)}`,
+      `/keys/count?deviceId=${encodeURIComponent(deviceId)}`,
       deviceId,
     );
   }
 
   claimAll(deviceId: string, peerUserId: string): Promise<ClaimAllResponse> {
-    return this.authedJson("POST", "/api/chat/keys/claim_all", deviceId, {
+    return this.authedJson("POST", "/keys/claim_all", deviceId, {
       peerUserId: peerUserId,
     });
   }
@@ -158,41 +176,41 @@ export class HttpClient {
   listDevices(deviceId: string, peerUserId: string): Promise<ListDevicesResponse> {
     return this.authedJson(
       "GET",
-      `/api/chat/keys/list_devices?peerUserId=${encodeURIComponent(peerUserId)}`,
+      `/keys/list_devices?peerUserId=${encodeURIComponent(peerUserId)}`,
       deviceId,
     );
   }
 
-  // ── /api/chat/envelopes ────────────────────────────────────────────────────
+  // ── envelopes ──────────────────────────────────────────────────────────────
 
   pending(deviceId: string, limit = 100): Promise<PendingResponse> {
     return this.authedJson(
       "GET",
-      `/api/chat/envelopes/pending?deviceId=${encodeURIComponent(deviceId)}&limit=${limit}`,
+      `/envelopes/pending?deviceId=${encodeURIComponent(deviceId)}&limit=${limit}`,
       deviceId,
     );
   }
 
   ack(deviceId: string, envelopeUuids: string[]): Promise<{ ok: true; deletedCount: number }> {
     const body: AckRequest = { deviceId: deviceId, envelopeUuids: envelopeUuids };
-    return this.authedJson("POST", "/api/chat/envelopes/ack", deviceId, body);
+    return this.authedJson("POST", "/envelopes/ack", deviceId, body);
   }
 
-  // ── /api/chat/blocks ───────────────────────────────────────────────────────
+  // ── blocks ─────────────────────────────────────────────────────────────────
 
   blockUser(deviceId: string, peerUserId: string): Promise<{ ok: true }> {
-    return this.authedJson("POST", "/api/chat/blocks", deviceId, { peerUserId: peerUserId });
+    return this.authedJson("POST", "/blocks", deviceId, { peerUserId: peerUserId });
   }
 
   unblockUser(deviceId: string, peerUserId: string): Promise<{ ok: true }> {
     return this.authedJson(
       "DELETE",
-      `/api/chat/blocks/${encodeURIComponent(peerUserId)}`,
+      `/blocks/${encodeURIComponent(peerUserId)}`,
       deviceId,
     );
   }
 
   listBlocked(deviceId: string): Promise<BlocksListResponse> {
-    return this.authedJson("GET", "/api/chat/blocks", deviceId);
+    return this.authedJson("GET", "/blocks", deviceId);
   }
 }

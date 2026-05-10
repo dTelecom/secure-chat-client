@@ -73,16 +73,16 @@ describe("KeyBundleManager", () => {
       apiBaseURL: "http://test",
       fetchChatToken: async () => fakeMint(),
       fetchImpl: makeFetch({
-        "POST /api/chat/keys/upload": async (req) => {
-          httpCalls.push({ method: req.method, path: "/api/chat/keys/upload", body: await req.json() });
+        "POST /keys/upload": async (req) => {
+          httpCalls.push({ method: req.method, path: "/keys/upload", body: await req.json() });
           return jsonOk({ ok: true });
         },
-        "POST /api/chat/keys/topup": async (req) => {
-          httpCalls.push({ method: req.method, path: "/api/chat/keys/topup", body: await req.json() });
+        "POST /keys/topup": async (req) => {
+          httpCalls.push({ method: req.method, path: "/keys/topup", body: await req.json() });
           return jsonOk({ ok: true, currentCount: 100 });
         },
-        "GET /api/chat/keys/count": async () => {
-          httpCalls.push({ method: "GET", path: "/api/chat/keys/count" });
+        "GET /keys/count": async () => {
+          httpCalls.push({ method: "GET", path: "/keys/count" });
           return jsonOk({ count: otkCount });
         },
       }),
@@ -95,7 +95,7 @@ describe("KeyBundleManager", () => {
     await mgr.ensureKeyBundle();
     expect(await crypto.hasAccount()).toBe(true);
     expect(httpCalls).toHaveLength(1);
-    expect(httpCalls[0].path).toBe("/api/chat/keys/upload");
+    expect(httpCalls[0].path).toBe("/keys/upload");
     const body = httpCalls[0].body as { deviceId: string; oneTimeKeys: unknown[] };
     expect(body.deviceId).toBe("dev1");
     expect(body.oneTimeKeys).toHaveLength(100);
@@ -107,7 +107,7 @@ describe("KeyBundleManager", () => {
     await mgr.ensureKeyBundle();
     await mgr.ensureKeyBundle();
     await mgr.ensureKeyBundle();
-    expect(httpCalls.filter((c) => c.path === "/api/chat/keys/upload")).toHaveLength(1);
+    expect(httpCalls.filter((c) => c.path === "/keys/upload")).toHaveLength(1);
   });
 
   it("topUpIfNeeded skips when count is healthy", async () => {
@@ -116,7 +116,7 @@ describe("KeyBundleManager", () => {
     await mgr.ensureKeyBundle();
     const r = await mgr.topUpIfNeeded();
     expect(r.topped).toBe(false);
-    expect(httpCalls.filter((c) => c.path === "/api/chat/keys/topup")).toHaveLength(0);
+    expect(httpCalls.filter((c) => c.path === "/keys/topup")).toHaveLength(0);
   });
 
   it("topUpIfNeeded refills when count drops below watermark", async () => {
@@ -128,7 +128,7 @@ describe("KeyBundleManager", () => {
     const r = await mgr.topUpIfNeeded();
     expect(r.topped).toBe(true);
     expect(r.newCount).toBe(100);
-    const topup = httpCalls.find((c) => c.path === "/api/chat/keys/topup");
+    const topup = httpCalls.find((c) => c.path === "/keys/topup");
     expect(topup).toBeTruthy();
     const body = topup!.body as { oneTimeKeys: unknown[] };
     expect(body.oneTimeKeys.length).toBe(95); // 100 target - 5 existing
@@ -159,7 +159,7 @@ describe("SessionManager", () => {
       apiBaseURL: "http://test",
       fetchChatToken: async () => fakeMint(),
       fetchImpl: makeFetch({
-        "POST /api/chat/keys/claim_all": async () => {
+        "POST /keys/claim_all": async () => {
           claimAllCalls++;
           return jsonOk({ devices: claimAllResp });
         },
@@ -244,7 +244,7 @@ describe("PeerDeviceCache", () => {
       apiBaseURL: "http://test",
       fetchChatToken: async () => fakeMint(),
       fetchImpl: makeFetch({
-        "GET /api/chat/keys/list_devices": () => {
+        "GET /keys/list_devices": () => {
           calls++;
           return jsonOk({ devices });
         },

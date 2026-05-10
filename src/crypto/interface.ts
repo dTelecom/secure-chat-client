@@ -6,7 +6,7 @@
 
 import type { ClaimedDevice } from "../types.js";
 
-/** Public material the SDK uploads via POST /api/chat/keys/upload. */
+/** Public material the SDK uploads via POST /keys/upload. */
 export interface UploadBundle {
   identityKeyCurve: string;
   identityKeyEd: string;

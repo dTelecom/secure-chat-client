@@ -8,7 +8,7 @@
 //   step 2: drain bob's pool via 100 repeated claim_all calls (raw
 //           HTTP — bypasses the SDK's per-peer cache so each call
 //           pops one OTK).
-//   step 3: confirm /api/chat/keys/count returns 0.
+//   step 3: confirm /keys/count returns 0.
 //   step 4: alice (a fresh SDK instance with no cached session) sends
 //           text → her claim_all gets `oneTimeKey: null`, the OlmCrypto
 //           adapter falls back to bob's fallbackPrekey for the outbound
@@ -38,7 +38,7 @@ await runSmoke("smoke:otk-exhaustion", async () => {
     fetchChatToken: mintTokenFor(drainerUser),
   });
   // Make the drainer registered (mint a token under its user id so
-  // /api/chat/keys/claim_all auth passes).
+  // /keys/claim_all auth passes).
   await drainerHttp.getMint("drainer-dev");
 
   for (let i = 0; i < 100; i++) {

@@ -58,7 +58,7 @@ export async function delay(ms: number): Promise<void> {
 
 export function mintTokenFor(userId: string) {
   return async (deviceId: string): Promise<MintTokenResponse> => {
-    const res = await fetch(`${API_BASE_URL}/api/chat/token`, {
+    const res = await fetch(`${API_BASE_URL}/token`, {
       method: "POST",
       headers: { "content-type": "application/json", "x-test-user": userId },
       body: JSON.stringify({ deviceId }),
@@ -135,7 +135,7 @@ export async function sdkConnect(
  * Some Stage D smokes verify the offline-fallback POST flow — the deployed
  * dtelecom node fires an HTTP POST to the chat token's `chat_webhook_url`
  * when a target is offline. By default the mock issues tokens with
- * `chat_webhook_url=http://localhost:8787/api/chat/envelopes`, which the
+ * `chat_webhook_url=http://localhost:8787/envelopes`, which the
  * deployed nodes (running on dtel.network) cannot reach. To run those
  * smokes, expose the mock at a publicly-reachable URL (e.g. via ngrok)
  * and set the mock's CHAT_WEBHOOK_URL env var. This helper detects the
@@ -151,7 +151,7 @@ export async function requireReachableWebhook(name: string): Promise<void> {
     console.log(
       `\n${name}: SKIPPED — chat_webhook_url is ${url}; the deployed dtelecom\n` +
         `nodes can't reach localhost. Expose the mock publicly (e.g. ngrok)\n` +
-        `and re-run with CHAT_WEBHOOK_URL=https://<tunnel>/api/chat/envelopes\n` +
+        `and re-run with CHAT_WEBHOOK_URL=https://<tunnel>/envelopes\n` +
         `set in the mock's environment.\n`,
     );
     process.exit(0); // not a failure — environment-blocked

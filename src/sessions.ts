@@ -13,7 +13,7 @@ import type { ClaimedDevice } from "./types.js";
 export interface SessionManagerOptions {
   http: HttpClient;
   crypto: CryptoAdapter;
-  /** This device's id, used to authenticate /api/chat/keys/claim_all. */
+  /** This device's id, used to authenticate /keys/claim_all. */
   selfDeviceId: string;
   /** This user's id. When sending to self (multi-device echo), used to
    *  filter our own device from the fanout. */
