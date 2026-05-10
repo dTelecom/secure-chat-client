@@ -1,0 +1,297 @@
+// Higher-level SDK tests — verify the public DTelecomSecureChat API behaves
+// per spec for getHistory + read-receipts preference + verification flag.
+// Uses the FakeCryptoAdapter and a mocked fetch so these run alongside the
+// unit suite without WASM or network.
+//
+// Network-side WS behavior is covered by the live smokes
+// (smoke:transport, smoke:cross-node).
+
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { DTelecomSecureChat } from "../src/index.js";
+import { FakeCryptoAdapter } from "../src/crypto/fake-adapter.js";
+import { MessageStore } from "../src/message_store.js";
+import { MemoryKVStore } from "../src/store/memory-adapter.js";
+import type { MintTokenResponse } from "../src/types.js";
+
+// ── Fake transport: minimal WS that never fires open ────────────────────────
+
+const realWebSocket = globalThis.WebSocket;
+
+class NeverConnectingWs {
+  static OPEN = 1;
+  static CLOSED = 3;
+  readyState = 0;
+  onopen: ((ev: Event) => void) | null = null;
+  onclose: ((ev: CloseEvent) => void) | null = null;
+  onmessage: ((ev: MessageEvent) => void) | null = null;
+  onerror: ((ev: Event) => void) | null = null;
+  send(_data: string): void {
+    // never reached
+  }
+  close(): void {
+    this.readyState = NeverConnectingWs.CLOSED;
+    queueMicrotask(() => this.onclose?.(new Event("close") as CloseEvent));
+  }
+  constructor(public url: string) {
+    // Open right away so connect() resolves; tests don't actually exercise
+    // the WS path.
+    queueMicrotask(() => {
+      this.readyState = NeverConnectingWs.OPEN;
+      this.onopen?.(new Event("open"));
+    });
+  }
+}
+
+beforeEach(() => {
+  (globalThis as unknown as { WebSocket: typeof WebSocket }).WebSocket =
+    NeverConnectingWs as unknown as typeof WebSocket;
+});
+afterEach(() => {
+  (globalThis as unknown as { WebSocket: typeof WebSocket }).WebSocket = realWebSocket;
+});
+
+// ── Fake fetch covering exactly what bootstrap + the preference path uses ──
+
+interface MockServerCalls {
+  blockPosts: string[]; // peerUserIds passed to POST /api/chat/blocks
+  blockDeletes: string[]; // peerUserIds passed to DELETE /api/chat/blocks/:peerUserId
+  blocked: Set<string>;
+}
+
+function makeMockFetch(calls?: MockServerCalls): typeof fetch {
+  return async (input, init) => {
+    const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+    const u = new URL(url);
+    const method = (init?.method ?? "GET").toUpperCase();
+    if (u.pathname === "/api/chat/keys/upload") {
+      return jsonOk({ ok: true });
+    }
+    if (u.pathname === "/api/chat/keys/count") {
+      return jsonOk({ count: 100 });
+    }
+    if (u.pathname === "/api/chat/blocks" && method === "POST") {
+      const body = JSON.parse((init?.body as string) ?? "{}") as { peerUserId: string };
+      calls?.blockPosts.push(body.peerUserId);
+      calls?.blocked.add(body.peerUserId);
+      return jsonOk({ ok: true });
+    }
+    if (u.pathname.startsWith("/api/chat/blocks/") && method === "DELETE") {
+      const peer = decodeURIComponent(u.pathname.slice("/api/chat/blocks/".length));
+      calls?.blockDeletes.push(peer);
+      calls?.blocked.delete(peer);
+      return jsonOk({ ok: true });
+    }
+    if (u.pathname === "/api/chat/blocks" && method === "GET") {
+      return jsonOk({ blocked: Array.from(calls?.blocked ?? []) });
+    }
+    return new Response(JSON.stringify({ error: "not_implemented", path: u.pathname }), {
+      status: 501,
+      headers: { "content-type": "application/json" },
+    });
+  };
+}
+
+function jsonOk(body: unknown): Response {
+  return new Response(JSON.stringify(body), {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  });
+}
+
+// JWT with sub=alice, exp far in the future. Body field name is `chat_token`
+// per `MintTokenResponse` shape (legacy snake_case alias retained for
+// backward-compat parsing — see types.ts).
+const FAKE_JWT_ALICE =
+  "header." + btoaUrl(JSON.stringify({ sub: "alice", did: "alice-dev", exp: 9999999999 })) + ".sig";
+
+function btoaUrl(s: string): string {
+  return btoa(s).replace(/=+$/, "").replace(/\+/g, "-").replace(/\//g, "_");
+}
+
+async function connectAlice(
+  store: MemoryKVStore = new MemoryKVStore(),
+  calls?: MockServerCalls,
+): Promise<DTelecomSecureChat> {
+  return DTelecomSecureChat.connect({
+    apiBaseURL: "http://test",
+    fetchChatToken: async () => mintAlice(),
+    store,
+    crypto: new FakeCryptoAdapter(),
+    fetchImpl: makeMockFetch(calls),
+  });
+}
+
+function mintAlice(): MintTokenResponse {
+  return {
+    chatToken: FAKE_JWT_ALICE,
+    expiresAt: 9999999999,
+    chatNodeWsUrl: "wss://fake/chat/ws",
+  };
+}
+
+// ── tests ──────────────────────────────────────────────────────────────────
+
+describe("DTelecomSecureChat — getHistory delegates to MessageStore.listForPeer", () => {
+  it("returns local-sent and inbound messages, oldest→newest, per peer", async () => {
+    // Direct MessageStore exercise — getHistory is a thin pass-through and
+    // its own tests live in status-outbox-typing.test.ts.
+    const kv = new MemoryKVStore();
+    const store = new MessageStore(kv);
+    for (let i = 1; i <= 3; i++) {
+      await store.put({
+        id: `m${i}`,
+        peerUserId: "alice",
+        senderUserId: i % 2 === 0 ? "self" : "alice",
+        text: `m${i}`,
+        sentAt: i,
+        editedAt: null,
+        deletedAt: null,
+      });
+    }
+    const list = await store.listForPeer("alice");
+    expect(list.map((m) => m.id)).toEqual(["m1", "m2", "m3"]);
+  });
+});
+
+describe("DTelecomSecureChat — read-receipts preference", () => {
+  it("default is enabled", async () => {
+    const sdk = await connectAlice();
+    expect(await sdk.areReadReceiptsEnabled()).toBe(true);
+    await sdk.disconnect();
+  });
+
+  it("setReadReceiptsEnabled(false) takes effect immediately and persists", async () => {
+    const kv = new MemoryKVStore();
+    const sdk1 = await connectAlice(kv);
+    await sdk1.setReadReceiptsEnabled(false);
+    expect(await sdk1.areReadReceiptsEnabled()).toBe(false);
+    await sdk1.disconnect();
+
+    const sdk2 = await connectAlice(kv);
+    expect(await sdk2.areReadReceiptsEnabled()).toBe(false);
+    await sdk2.disconnect();
+  });
+
+  it("re-enabling restores", async () => {
+    const sdk = await connectAlice();
+    await sdk.setReadReceiptsEnabled(false);
+    await sdk.setReadReceiptsEnabled(true);
+    expect(await sdk.areReadReceiptsEnabled()).toBe(true);
+    await sdk.disconnect();
+  });
+
+  it("markRead is a no-op when read receipts are disabled (gating works)", async () => {
+    // We can't observe the absence of a WS frame with the fake transport
+    // (NeverConnectingWs.send is a no-op), but we CAN observe whether the
+    // SDK reaches the encrypt path. Encrypt-for-peer would call claim_all
+    // → /api/chat/keys/claim_all on the mock fetch. The mock returns 501,
+    // which would surface as a thrown error from sendContent's encrypt
+    // call. With gating ON, markRead returns early before encrypt — so
+    // nothing throws.
+    const sdk = await connectAlice();
+    await sdk.setReadReceiptsEnabled(false);
+    // Should resolve without ever hitting the network — the gate exits
+    // before any HTTP call.
+    await expect(sdk.markRead("bob", "any-message-id")).resolves.toBeUndefined();
+    await sdk.disconnect();
+  });
+});
+
+describe("DTelecomSecureChat — peer-device verification flags", () => {
+  it("starts unverified; mark sets; unmark clears", async () => {
+    const sdk = await connectAlice();
+    expect(await sdk.isPeerDeviceVerified("bob", "bob-phone")).toBe(false);
+    await sdk.markPeerDeviceVerified("bob", "bob-phone", true);
+    expect(await sdk.isPeerDeviceVerified("bob", "bob-phone")).toBe(true);
+    await sdk.markPeerDeviceVerified("bob", "bob-phone", false);
+    expect(await sdk.isPeerDeviceVerified("bob", "bob-phone")).toBe(false);
+    await sdk.disconnect();
+  });
+
+  it("verification flag is per (peerUser, peerDevice)", async () => {
+    const sdk = await connectAlice();
+    await sdk.markPeerDeviceVerified("bob", "bob-phone", true);
+    expect(await sdk.isPeerDeviceVerified("bob", "bob-laptop")).toBe(false);
+    expect(await sdk.isPeerDeviceVerified("carol", "bob-phone")).toBe(false);
+    await sdk.disconnect();
+  });
+
+  it("verification persists across reconnect", async () => {
+    const kv = new MemoryKVStore();
+    const sdk1 = await connectAlice(kv);
+    await sdk1.markPeerDeviceVerified("bob", "bob-phone", true);
+    await sdk1.disconnect();
+
+    const sdk2 = await connectAlice(kv);
+    expect(await sdk2.isPeerDeviceVerified("bob", "bob-phone")).toBe(true);
+    await sdk2.disconnect();
+  });
+});
+
+describe("DTelecomSecureChat — getHistory survives reconnect on same store", () => {
+  it("messages written by SDK#1 are visible to SDK#2 sharing the store", async () => {
+    const kv = new MemoryKVStore();
+    // SDK#1 boots and we drop a message into its store via the underlying
+    // MessageStore (the SDK's own write path is exercised by the smoke).
+    const sdk1 = await connectAlice(kv);
+    const store1 = new MessageStore(kv);
+    await store1.put({
+      id: "m1", peerUserId: "bob", senderUserId: "alice",
+      text: "persisted across reconnect", sentAt: 1_000,
+      editedAt: null, deletedAt: null,
+    });
+    const before = await sdk1.getHistory("bob");
+    expect(before.map((m) => m.text)).toEqual(["persisted across reconnect"]);
+    await sdk1.disconnect();
+
+    // SDK#2 shares the same KV store → getHistory finds the same row.
+    const sdk2 = await connectAlice(kv);
+    const after = await sdk2.getHistory("bob");
+    expect(after.map((m) => m.text)).toEqual(["persisted across reconnect"]);
+    expect(after.map((m) => m.id)).toEqual(before.map((m) => m.id));
+    await sdk2.disconnect();
+  });
+
+  it("a fresh store starts with an empty history (no server replay)", async () => {
+    const sdk = await connectAlice(new MemoryKVStore());
+    expect(await sdk.getHistory("bob")).toEqual([]);
+    await sdk.disconnect();
+  });
+});
+
+describe("DTelecomSecureChat — block / unblock", () => {
+  function emptyCalls(): MockServerCalls {
+    return { blockPosts: [], blockDeletes: [], blocked: new Set() };
+  }
+
+  it("blockUser POSTs /api/chat/blocks with the peer id", async () => {
+    const calls = emptyCalls();
+    const sdk = await connectAlice(new MemoryKVStore(), calls);
+    await sdk.blockUser("bob");
+    expect(calls.blockPosts).toEqual(["bob"]);
+    expect(calls.blocked.has("bob")).toBe(true);
+    await sdk.disconnect();
+  });
+
+  it("unblockUser DELETEs /api/chat/blocks/:peerId", async () => {
+    const calls = emptyCalls();
+    const sdk = await connectAlice(new MemoryKVStore(), calls);
+    await sdk.blockUser("bob");
+    await sdk.unblockUser("bob");
+    expect(calls.blockDeletes).toEqual(["bob"]);
+    expect(calls.blocked.has("bob")).toBe(false);
+    await sdk.disconnect();
+  });
+
+  it("getBlockedUsers reflects the server view", async () => {
+    const calls = emptyCalls();
+    const sdk = await connectAlice(new MemoryKVStore(), calls);
+    await sdk.blockUser("bob");
+    await sdk.blockUser("carol");
+    const list = await sdk.getBlockedUsers();
+    expect([...list].sort()).toEqual(["bob", "carol"]);
+    await sdk.unblockUser("bob");
+    expect(await sdk.getBlockedUsers()).toEqual(["carol"]);
+    await sdk.disconnect();
+  });
+});

@@ -1,0 +1,82 @@
+{
+  "name": "@dtelecom/secure-chat-client",
+  "version": "0.1.0",
+  "description": "TypeScript SDK for dTelecom secure 1:1 chat (E2E via Olm/vodozemac, fanout multi-device).",
+  "type": "module",
+  "main": "dist/index.cjs",
+  "module": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      }
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:browser": "vitest run -c vitest.browser.config.ts",
+    "smoke:wallet": "tsx scripts/smoke-wallet.ts",
+    "smoke:transport": "tsx scripts/smoke-transport.ts",
+    "smoke:cross-node": "tsx scripts/smoke-cross-node.ts",
+    "smoke:auth": "tsx scripts/smoke-auth.ts",
+    "smoke:fanout": "tsx scripts/smoke-fanout.ts",
+    "smoke:ephemeral": "tsx scripts/smoke-ephemeral.ts",
+    "smoke:offline-fallback": "tsx scripts/smoke-offline-fallback.ts",
+    "smoke:push-gating": "tsx scripts/smoke-push-gating.ts",
+    "smoke:edit-delete-authz": "tsx scripts/smoke-edit-delete-authz.ts",
+    "smoke:read-typing": "tsx scripts/smoke-read-typing.ts",
+    "smoke:fwd-compat": "tsx scripts/smoke-fwd-compat.ts",
+    "smoke:crash-recovery": "tsx scripts/smoke-crash-recovery.ts",
+    "smoke:node-failure": "tsx scripts/smoke-node-failure.ts",
+    "smoke:block": "tsx scripts/smoke-block.ts",
+    "smoke:history-reload": "tsx scripts/smoke-history-reload.ts",
+    "smoke:multi-device-sender": "tsx scripts/smoke-multi-device-sender.ts",
+    "smoke:self-echo": "tsx scripts/smoke-self-echo.ts",
+    "smoke:peer-new-device": "tsx scripts/smoke-peer-new-device.ts",
+    "smoke:otk-exhaustion": "tsx scripts/smoke-otk-exhaustion.ts",
+    "smoke:read-receipts-gating": "tsx scripts/smoke-read-receipts-gating.ts",
+    "smoke:idle": "tsx scripts/smoke-idle.ts",
+    "smoke:all": "tsx scripts/smoke-all.ts"
+  },
+  "keywords": [
+    "dtelecom",
+    "chat",
+    "e2ee",
+    "olm",
+    "matrix"
+  ],
+  "author": "dTelecom <dev@dtelecom.org>",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/dTelecom/secure-chat-client.git"
+  },
+  "homepage": "https://github.com/dTelecom/secure-chat-client#readme",
+  "dependencies": {
+    "@dtelecom/vodozemac-wasm": "^0.1.0",
+    "@noble/ed25519": "^2.1.0",
+    "@noble/hashes": "^1.5.0",
+    "bs58": "^6.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@vitest/browser": "^3.2.4",
+    "playwright": "^1.59.1",
+    "tsup": "^8.0.0",
+    "tsx": "^4.7.0",
+    "typescript": "^5.7.0",
+    "vitest": "^3.0.0"
+  }
+}
