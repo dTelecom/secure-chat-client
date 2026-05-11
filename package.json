@@ -1,6 +1,6 @@
 {
   "name": "@dtelecom/secure-chat-client",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "TypeScript SDK for dTelecom secure 1:1 chat (E2E via Olm/vodozemac, fanout multi-device).",
   "type": "module",
   "main": "dist/index.cjs",
@@ -40,13 +40,13 @@
     "smoke:fwd-compat": "tsx scripts/smoke-fwd-compat.ts",
     "smoke:crash-recovery": "tsx scripts/smoke-crash-recovery.ts",
     "smoke:node-failure": "tsx scripts/smoke-node-failure.ts",
-    "smoke:block": "tsx scripts/smoke-block.ts",
     "smoke:history-reload": "tsx scripts/smoke-history-reload.ts",
     "smoke:multi-device-sender": "tsx scripts/smoke-multi-device-sender.ts",
     "smoke:self-echo": "tsx scripts/smoke-self-echo.ts",
     "smoke:peer-new-device": "tsx scripts/smoke-peer-new-device.ts",
     "smoke:otk-exhaustion": "tsx scripts/smoke-otk-exhaustion.ts",
     "smoke:read-receipts-gating": "tsx scripts/smoke-read-receipts-gating.ts",
+    "smoke:conversations": "tsx scripts/smoke-conversations.ts",
     "smoke:idle": "tsx scripts/smoke-idle.ts",
     "smoke:all": "tsx scripts/smoke-all.ts"
   },

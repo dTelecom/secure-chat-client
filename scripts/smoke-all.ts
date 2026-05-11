@@ -18,13 +18,13 @@ const SCRIPTS = [
   "smoke-fwd-compat.ts",
   "smoke-crash-recovery.ts",
   "smoke-node-failure.ts",
-  "smoke-block.ts",
   "smoke-history-reload.ts",
   "smoke-multi-device-sender.ts",
   "smoke-self-echo.ts",
   "smoke-peer-new-device.ts",
   "smoke-otk-exhaustion.ts",
   "smoke-read-receipts-gating.ts",
+  "smoke-conversations.ts",
   "smoke-idle.ts",
 ];
 

@@ -4,7 +4,16 @@ TypeScript SDK for end-to-end encrypted 1:1 chat over the dTelecom mesh. Olm via
 
 ## Status
 
-v0.2.0 — feature complete.
+v0.3.0 — feature complete.
+
+> **v0.3.0 changes vs v0.2.0:**
+> - **Add** `chat.listConversations()` + the `conversationsChanged` event — a per-peer threads index derived from the local message store + a per-peer read watermark, persisted via the configured KV adapter. Unread counts converge across own devices because `markRead` self-echoes.
+> - **Add** `chat.on("connectionStateChange", …)` — surfaces the WS state (`"connecting" | "open" | "reconnecting" | "closed"`) so the UI can render an offline / reconnecting banner.
+> - **Add** `chat.currentUserId` getter (parsed from the chat token's `sub` claim).
+> - **Add** `chat.deleteConversation(peerUserId)` — wipes the thread's stored messages + index row locally. Doesn't tear down the Olm session, so future inbound from the peer will re-create the thread (use the host's block UX if you want the peer's traffic dropped entirely).
+> - **Local-side effect on `chat.markRead()`** — now always advances the local "last-read-from-peer" watermark (driving the unread count) even when outbound read receipts are disabled via `setReadReceiptsEnabled(false)`.
+> - **Remove** `chat.blockUser()` / `chat.unblockUser()` / `chat.getBlockedUsers()`. Hosts with their own user-block UX (e.g. dmeet's `/api/users/block-user`) write to the same row the chat handlers query, so chat-specific block methods were duplicate surface. The contract's `/blocks` endpoints stay in the in-memory mock for smoke tests; production backends don't need them.
+> - **Add** `chat.setBlockedUserIds(ids[])` + `chat.getLocallyBlockedUserIds()` + `connect({ initialBlockedUserIds })`. The block list itself lives in the host (e.g. dmeet) — the SDK only keeps a local mirror so inbound messages from a now-blocked peer arriving over an EXISTING Olm session (which is NOT torn down on block, by design — see plan §14) get dropped before they hit the UI. Persisted in KV so a cold-start drain doesn't briefly leak blocked content before the host re-pushes its view.
 
 > **v0.2.0 breaking change vs v0.1.0:** `apiBaseURL` is now the FULL endpoint prefix (host + path), and the SDK appends bare relative paths (`/token`, `/keys/upload`, `/envelopes/pending`, etc.) instead of hardcoding `/api/chat/`. Update consumers from `apiBaseURL: "https://app.example"` → `apiBaseURL: "https://app.example/api/secure-chat"` (or wherever the backend mounts the API).
 
@@ -39,7 +48,15 @@ const chat = await DTelecomSecureChat.connect({
     });
     return r.json(); // { chatToken, chatNodeWsUrl, expiresAt }
   },
+  // Optional. The current user-block set, sourced from your host backend
+  // (e.g. dmeet's /api/users/block-user UX). Inbound messages from these
+  // peers arriving over a previously-established Olm session are dropped
+  // BEFORE they surface to the UI. Push updates via chat.setBlockedUserIds.
+  initialBlockedUserIds: ["bad-user-1", "bad-user-2"],
 });
+
+// Who is the signed-in user? (parsed from the chat token's `sub` claim)
+chat.currentUserId;
 
 chat.on("message", (e) => console.log(e.peerUserId, "→", e.message.text));
 chat.on("messageEdited", (e) => /* ... */);
@@ -48,6 +65,8 @@ chat.on("statusChange", (e) => /* sent → delivered → deliveredAll → read *
 chat.on("typing", (e) => /* started / stopped */);
 chat.on("readReceipt", (e) => /* upTo a given message id */);
 chat.on("peerNewDevice", (e) => /* TOFU UI */);
+chat.on("conversationsChanged", () => /* re-render the chat list */);
+chat.on("connectionStateChange", (e) => /* "connecting" | "open" | "reconnecting" | "closed" */);
 
 await chat.sendText("bob-user-id", "hi bob");
 await chat.editMessage("bob-user-id", messageId, "edited");
@@ -55,15 +74,29 @@ await chat.deleteMessage("bob-user-id", messageId);
 await chat.markRead("bob-user-id", messageId);
 chat.setTyping("bob-user-id", true);
 
+// Conversation list for the chat tab. Each entry has lastMessageAt + a
+// snapshot of the latest message + an unread count. Sorted most-recent-
+// first. Empty on a brand-new device (no historical sync).
+const convs = await chat.listConversations();
+
 const history = await chat.getHistory("bob-user-id", { limit: 50 });
 
-await chat.blockUser("alice");
-await chat.unblockUser("alice");
-const blocked = await chat.getBlockedUsers();
+// "Remove from list" UX — wipes the thread's stored messages + index row
+// locally. The Olm session stays alive; future inbound from this peer
+// re-creates the thread.
+await chat.deleteConversation("bob-user-id");
+
+// Push the host's current block list whenever it changes (e.g. user
+// hits "Block" in dmeet's profile UI).
+await chat.setBlockedUserIds(["bad-user-1"]);
 
 await chat.setReadReceiptsEnabled(false);
 await chat.markPeerDeviceVerified("bob", "bob-phone", true);
 const fingerprint = await chat.getPeerDeviceFingerprint("bob", "bob-phone");
+
+// Block / unblock is intentionally NOT in this SDK — host apps with their
+// own block UX (e.g. dmeet's /api/users/block-user) write the same rows
+// the chat backend reads for silent-filter on claim_all + envelope POST.
 ```
 
 ## Architecture

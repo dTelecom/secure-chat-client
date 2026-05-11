@@ -83,16 +83,16 @@ describe("HttpClient", () => {
       apiBaseURL: "http://test",
       fetchChatToken: fetchToken,
       fetchImpl: makeFetch({
-        "GET /blocks": (req) => {
+        "GET /keys/count": (req) => {
           seen.push(req.headers.get("authorization") ?? "");
-          return new Response(JSON.stringify({ blocked: [] }), {
+          return new Response(JSON.stringify({ count: 0 }), {
             status: 200,
             headers: { "content-type": "application/json" },
           });
         },
       }),
     });
-    await client.listBlocked("dev1");
+    await client.otkCount("dev1");
     expect(seen[0]).toBe(`Bearer ${FAKE_JWT}`);
   });
 
@@ -101,17 +101,28 @@ describe("HttpClient", () => {
       apiBaseURL: "http://test",
       fetchChatToken: async () => fakeMint(),
       fetchImpl: makeFetch({
-        "POST /blocks": () =>
-          new Response(JSON.stringify({ error: "self_block", message: "cannot block self" }), {
+        "POST /keys/upload": () =>
+          new Response(JSON.stringify({ error: "invalid_bundle", message: "bad signature" }), {
             status: 400,
             headers: { "content-type": "application/json" },
           }),
       }),
     });
-    await expect(client.blockUser("dev1", "alice")).rejects.toMatchObject({
+    await expect(
+      client.uploadKeyBundle("dev1", {
+        deviceId: "dev1",
+        identityKeyCurve: "x",
+        identityKeyEd: "x",
+        signedPrekey: "x",
+        signedPrekeySig: "x",
+        fallbackPrekey: "x",
+        fallbackPrekeySig: "x",
+        fingerprint: "x",
+      }),
+    ).rejects.toMatchObject({
       name: "HttpError",
       status: 400,
-      code: "self_block",
+      code: "invalid_bundle",
     });
   });
 
@@ -141,9 +152,6 @@ describe("HttpClient", () => {
         "GET /keys/list_devices": recordHandler(200, { devices: [] }),
         "GET /envelopes/pending": recordHandler(200, { envelopes: [] }),
         "POST /envelopes/ack": recordHandler(200, { ok: true, deletedCount: 0 }),
-        "POST /blocks": recordHandler(),
-        "DELETE /blocks/bob": recordHandler(),
-        "GET /blocks": recordHandler(200, { blocked: [] }),
       }),
     });
 
@@ -163,9 +171,6 @@ describe("HttpClient", () => {
     await client.listDevices("dev1", "alice");
     await client.pending("dev1", 50);
     await client.ack("dev1", ["env1"]);
-    await client.blockUser("dev1", "bob");
-    await client.unblockUser("dev1", "bob");
-    await client.listBlocked("dev1");
 
     expect(calls.map((c) => `${c.method} ${c.path}`)).toEqual([
       "POST /keys/upload",
@@ -175,9 +180,6 @@ describe("HttpClient", () => {
       "GET /keys/list_devices",
       "GET /envelopes/pending",
       "POST /envelopes/ack",
-      "POST /blocks",
-      "DELETE /blocks/bob",
-      "GET /blocks",
     ]);
     // ack carries deviceId + envelopeUuids
     expect(calls[6].body).toEqual({ deviceId: "dev1", envelopeUuids: ["env1"] });

@@ -21,6 +21,9 @@ import { loadOrCreateDeviceId } from "./device.js";
 import { PeerDeviceCache } from "./device_discovery.js";
 import { KeyBundleManager } from "./key_bundle.js";
 import { MessageStore, type StoredMessage } from "./message_store.js";
+import { ConversationIndex } from "./conversations.js";
+export type { Conversation } from "./conversations.js";
+import type { Conversation } from "./conversations.js";
 import { Outbox } from "./outbox.js";
 import { SessionManager } from "./sessions.js";
 import { StatusTracker, type MessageStatus } from "./status.js";
@@ -52,6 +55,19 @@ export interface ConnectOptions {
   /** Optional fetch implementation. Defaults to globalThis.fetch. Tests
    *  pass a mocked fetch to avoid real network calls. */
   fetchImpl?: typeof fetch;
+  /** Optional initial block list. Block enforcement lives mostly outside
+   *  the SDK (host backends like dmeet write their own user-block table,
+   *  which the chat backend reads server-side). But existing Olm sessions
+   *  with a now-blocked peer are NOT torn down, so inbound messages from
+   *  that peer can still arrive over the WS — the SDK drops them locally
+   *  per `chat-wire-contract.md` §14 / `secure-chat-plan.md` §14.
+   *
+   *  Pass the host's current block list here on connect; call
+   *  `chat.setBlockedUserIds` whenever it changes. The SDK also persists
+   *  the last-known list in KV, so a cold start during offline-pending
+   *  drain doesn't surface blocked messages before the host has refreshed
+   *  its view. */
+  initialBlockedUserIds?: string[];
 }
 
 // ── public event types ──────────────────────────────────────────────────────
@@ -112,6 +128,28 @@ export interface PeerNewDeviceEvt {
   fingerprint: string;
 }
 
+/**
+ * Emitted whenever a conversation row's lastMessage* or lastReadFromPeerAt
+ * changes (so unread counts and ordering are dirty). `changed` lists the
+ * specific peerUserIds whose state moved; the UI can recompute selectively
+ * or just reload the full list — both are cheap.
+ */
+export interface ConversationsChangedEvt {
+  changed: string[];
+}
+
+/**
+ * High-level WebSocket connection state for the chat tab to render
+ * "Offline" / "Reconnecting…" banners. Maps directly to the underlying
+ * `WsClient` state machine; `"closing"` is collapsed into `"closed"`
+ * because it's only a transient internal step.
+ */
+export type ConnectionState = "connecting" | "open" | "reconnecting" | "closed";
+
+export interface ConnectionStateChangedEvt {
+  state: ConnectionState;
+}
+
 interface EventMap {
   message: MessageReceived;
   messageEdited: MessageEdited;
@@ -120,6 +158,8 @@ interface EventMap {
   typing: TypingEvt;
   statusChange: StatusChangeEvt;
   peerNewDevice: PeerNewDeviceEvt;
+  conversationsChanged: ConversationsChangedEvt;
+  connectionStateChange: ConnectionStateChangedEvt;
 }
 
 type EventName = keyof EventMap;
@@ -130,6 +170,7 @@ type Listener<T extends EventName> = (event: EventMap[T]) => void;
 const RECEIVED_BATCH_FLUSH_MS = 500;
 const RECEIVED_BATCH_FLUSH_SIZE = 50;
 const READ_RECEIPTS_KEY = "prefs/readReceiptsEnabled";
+const BLOCKED_USERS_KEY = "prefs/blockedUserIds";
 
 /** Public shape returned by `getKnownPeerDevices()`. */
 export interface KnownPeerDevice {
@@ -154,6 +195,7 @@ export class DTelecomSecureChat {
   private sessions!: SessionManager;
   private peerDevices!: PeerDeviceCache;
   private messages!: MessageStore;
+  private conversations!: ConversationIndex;
   private status!: StatusTracker;
   private outbox = new Outbox();
   private typingMgr!: TypingManager;
@@ -172,6 +214,13 @@ export class DTelecomSecureChat {
   private bundleReuploadAttempted = false;
   /** Cache of the read-receipts preference (loaded lazily). */
   private readReceiptsCache: boolean | null = null;
+  /** Locally-enforced inbound block list. Source of truth lives in the host
+   *  app (e.g. dmeet's user-block table). The SDK only needs to know it so
+   *  inbound messages from a now-blocked peer over an EXISTING Olm session
+   *  are dropped before they surface to the UI. Persisted to KV so cold-
+   *  start drains don't briefly leak blocked content before the host has
+   *  pushed an update via `setBlockedUserIds`. */
+  private blockedUserIds = new Set<string>();
 
   /**
    * Connect to the dtelecom mesh. Generates an Olm account on first run,
@@ -192,6 +241,13 @@ export class DTelecomSecureChat {
     return this.deviceId;
   }
 
+  /** The signed-in user's id, as parsed from the chat token's `sub` claim.
+   *  Available after `connect()` resolves. Null only if the SDK has been
+   *  disconnected without ever connecting (shouldn't happen in practice). */
+  get currentUserId(): string | null {
+    return this.selfUserId;
+  }
+
   // ── public API: messaging ──────────────────────────────────────────────────
 
   async sendText(peerUserId: string, text: string, opts?: { replyTo?: string }): Promise<string> {
@@ -209,6 +265,12 @@ export class DTelecomSecureChat {
         editedAt: null,
         deletedAt: null,
         ...(event.replyTo !== undefined ? { replyTo: event.replyTo } : {}),
+      });
+      await this.bumpConversation({
+        peerUserId,
+        senderUserId: this.selfUserId,
+        messageId: event.id,
+        sentAt: event.clientSentAt,
       });
     }
     await this.selfEcho(peerUserId, event);
@@ -252,6 +314,11 @@ export class DTelecomSecureChat {
    * consumed (the sender's preference is their own call).
    */
   async markRead(peerUserId: string, upToMessageId: string): Promise<void> {
+    // Always advance the LOCAL read watermark — that's a private UX state
+    // and is the only thing the conversation list's unread count depends
+    // on. The wire-level read receipt to the sender is gated by
+    // setReadReceiptsEnabled.
+    await this.bumpReadWatermark(peerUserId, upToMessageId);
     if (!(await this.areReadReceiptsEnabled())) return;
     const event = newRead(upToMessageId);
     await this.sendContent(peerUserId, event, { ephemeral: false });
@@ -344,17 +411,73 @@ export class DTelecomSecureChat {
     return this.messages.listForPeer(peerUserId, opts);
   }
 
-  // ── public API: blocks ─────────────────────────────────────────────────────
+  /**
+   * Return all conversations this device knows about, sorted most-recent-
+   * activity first. Derived from the local message store + a per-peer
+   * read-watermark; survives reloads via the KV adapter.
+   *
+   * A brand-new device starts with an empty list and accumulates entries as
+   * peers send messages (or this user sends them). There is no historical
+   * sync — that matches the fanout-multi-device decision in
+   * `secure-chat-plan.md` §17.
+   *
+   * Subscribe to `conversationsChanged` to re-render the list incrementally.
+   */
+  listConversations(): Promise<Conversation[]> {
+    return this.conversations.list();
+  }
 
-  blockUser(peerUserId: string): Promise<{ ok: true }> {
-    return this.http.blockUser(this.deviceId, peerUserId);
+  // ── public API: local inbound block filter ─────────────────────────────────
+  //
+  // The host app owns the block list (e.g. dmeet's /api/users/block-user).
+  // The chat backend reads the same user_to_user_block rows to silently
+  // filter at claim_all + the envelope webhook. But Olm sessions ESTABLISHED
+  // before the block was set aren't torn down — see plan §14 — so the
+  // recipient SDK still has to drop inbound from blocked peers locally.
+  // These methods are how the host pushes the current list (and reads back
+  // what the SDK currently enforces).
+
+  /** Replace the locally-enforced inbound block set. Call on connect
+   *  (or via `initialBlockedUserIds`) and on every change in the host's
+   *  block UI. Persists to KV so the next cold start enforces the same
+   *  set during the offline-pending drain. */
+  async setBlockedUserIds(ids: readonly string[]): Promise<void> {
+    this.blockedUserIds = new Set(ids);
+    await this.store.setString(BLOCKED_USERS_KEY, JSON.stringify([...this.blockedUserIds]));
   }
-  unblockUser(peerUserId: string): Promise<{ ok: true }> {
-    return this.http.unblockUser(this.deviceId, peerUserId);
+
+  /** Read the SDK's current locally-enforced inbound block set. For
+   *  diagnostics — the source of truth is the host's user-block UX. */
+  getLocallyBlockedUserIds(): string[] {
+    return [...this.blockedUserIds];
   }
-  async getBlockedUsers(): Promise<string[]> {
-    const r = await this.http.listBlocked(this.deviceId);
-    return r.blocked;
+
+  // ── public API: thread housekeeping ────────────────────────────────────────
+
+  /** Remove all locally-stored state for a 1:1 thread: messages + conversation
+   *  index row. The Olm session is NOT torn down — future messages from this
+   *  peer will still arrive over the existing session and surface as new
+   *  conversation activity. Use this for "remove from list" UX. To stop
+   *  receiving altogether, the host's block UI is the right primitive. */
+  async deleteConversation(peerUserId: string): Promise<void> {
+    await this.messages.deleteForPeer(peerUserId);
+    await this.conversations.delete(peerUserId);
+    this.dispatch("conversationsChanged", { changed: [peerUserId] });
+  }
+
+  // ── internals: block-list persistence ──────────────────────────────────────
+
+  private async loadBlockedUserIds(): Promise<void> {
+    const raw = await this.store.getString(BLOCKED_USERS_KEY);
+    if (!raw) return;
+    try {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) {
+        this.blockedUserIds = new Set(parsed.filter((x): x is string => typeof x === "string"));
+      }
+    } catch {
+      // ignore malformed
+    }
   }
 
   // ── public API: events ─────────────────────────────────────────────────────
@@ -407,6 +530,18 @@ export class DTelecomSecureChat {
     });
     this.peerDevices = new PeerDeviceCache({ http: this.http, selfDeviceId: this.deviceId });
     this.messages = new MessageStore(this.store);
+    this.conversations = new ConversationIndex(
+      this.store,
+      this.messages,
+      () => this.selfUserId,
+    );
+    await this.conversations.load();
+    // Hydrate the block list — KV first (best-effort), then overlay any
+    // caller-provided initial value so the explicit option wins.
+    await this.loadBlockedUserIds();
+    if (opts.initialBlockedUserIds) {
+      await this.setBlockedUserIds(opts.initialBlockedUserIds);
+    }
     this.status = new StatusTracker();
     this.status.on((messageId, status, peerUserId) => {
       this.dispatch("statusChange", { peerUserId, messageId, status });
@@ -453,6 +588,13 @@ export class DTelecomSecureChat {
    * gap during disconnect.
    */
   private onWsState(s: string): void {
+    // Surface the state change to apps so the UI can render an offline /
+    // reconnecting banner. Collapse the transient "closing" step into
+    // "closed" — apps don't care about the difference.
+    const exposed: ConnectionState =
+      s === "open" ? "open" : s === "reconnecting" ? "reconnecting" : s === "connecting" ? "connecting" : "closed";
+    this.dispatch("connectionStateChange", { state: exposed });
+
     if (s !== "open") return;
     void this.outbox.tick();
     void this.drainPending().catch(() => {});
@@ -614,11 +756,60 @@ export class DTelecomSecureChat {
     });
   }
 
+  /**
+   * Bump the conversation index for a stored text message (inbound, outbound,
+   * or self-echo) and emit `conversationsChanged` if the row changed. Edits
+   * and deletes don't bump the index — only the original text counts as
+   * "activity," and the snippet is read fresh from MessageStore at list()
+   * time so edits show up automatically.
+   */
+  private async bumpConversation(opts: {
+    peerUserId: string;
+    senderUserId: string;
+    messageId: string;
+    sentAt: number;
+  }): Promise<void> {
+    const changed = await this.conversations.onMessageStored(opts);
+    if (changed) {
+      this.dispatch("conversationsChanged", { changed: [opts.peerUserId] });
+    }
+  }
+
+  /**
+   * Advance the local read watermark for `peerUserId`. Driven by outbound
+   * markRead AND by self-echoed read events from sibling devices, so the
+   * conversation list converges across own installs.
+   */
+  private async bumpReadWatermark(peerUserId: string, upToMessageId: string): Promise<void> {
+    const target = await this.messages.get(upToMessageId);
+    if (!target) return;
+    const changed = await this.conversations.markReadUpTo(peerUserId, target.sentAt);
+    if (changed) {
+      this.dispatch("conversationsChanged", { changed: [peerUserId] });
+    }
+  }
+
   private async dispatchInboundEvent(
     peerUserId: string,
     peerDeviceId: string,
     event: ContentEvent,
   ): Promise<void> {
+    // Local inbound block filter (plan §14 layer 3 / contract §2.10). We
+    // dropped the SDK's block-list HTTP methods because the host owns that
+    // state, but Olm sessions established BEFORE a block was set aren't
+    // torn down — so inbound from a now-blocked peer can still arrive
+    // here. Decrypt has already run (the ratchet must advance to stay in
+    // sync with the peer); we just don't persist, don't surface to the UI,
+    // and only ack content-bearing events so the offline queue drains
+    // normally. selfEcho is exempt because its `peerUserId` is selfUserId
+    // (the user can't block themselves).
+    if (this.blockedUserIds.has(peerUserId)) {
+      if (event.type === "text" || event.type === "edit" || event.type === "delete") {
+        this.queueReceivedAck(peerUserId, peerDeviceId, event.id);
+      }
+      return;
+    }
+
     switch (event.type) {
       case "text": {
         await this.messages.put({
@@ -630,6 +821,12 @@ export class DTelecomSecureChat {
           editedAt: null,
           deletedAt: null,
           ...(event.replyTo !== undefined ? { replyTo: event.replyTo } : {}),
+        });
+        await this.bumpConversation({
+          peerUserId,
+          senderUserId: peerUserId,
+          messageId: event.id,
+          sentAt: event.clientSentAt,
         });
         this.dispatch("message", {
           peerUserId,
@@ -716,6 +913,12 @@ export class DTelecomSecureChat {
               deletedAt: null,
               ...(inner.replyTo !== undefined ? { replyTo: inner.replyTo } : {}),
             });
+            await this.bumpConversation({
+              peerUserId: originalPeer,
+              senderUserId: peerUserId, // self
+              messageId: inner.id,
+              sentAt: inner.clientSentAt,
+            });
             this.dispatch("message", {
               peerUserId: originalPeer,
               peerDeviceId,
@@ -765,8 +968,11 @@ export class DTelecomSecureChat {
           }
           case "read": {
             // Mirror the read watermark so this device's chat ratchets
-            // statuses forward the same way the originating device did.
+            // statuses forward the same way the originating device did,
+            // AND so unread counts in listConversations() converge across
+            // own devices.
             this.status.onRead({ peerUserId: originalPeer, upToId: inner.upToId });
+            await this.bumpReadWatermark(originalPeer, inner.upToId);
             return;
           }
         }

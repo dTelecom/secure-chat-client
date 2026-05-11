@@ -52,37 +52,15 @@ afterEach(() => {
 
 // ── Fake fetch covering exactly what bootstrap + the preference path uses ──
 
-interface MockServerCalls {
-  blockPosts: string[]; // peerUserIds passed to POST /blocks
-  blockDeletes: string[]; // peerUserIds passed to DELETE /blocks/:peerUserId
-  blocked: Set<string>;
-}
-
-function makeMockFetch(calls?: MockServerCalls): typeof fetch {
-  return async (input, init) => {
+function makeMockFetch(): typeof fetch {
+  return async (input, _init) => {
     const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
     const u = new URL(url);
-    const method = (init?.method ?? "GET").toUpperCase();
     if (u.pathname === "/keys/upload") {
       return jsonOk({ ok: true });
     }
     if (u.pathname === "/keys/count") {
       return jsonOk({ count: 100 });
-    }
-    if (u.pathname === "/blocks" && method === "POST") {
-      const body = JSON.parse((init?.body as string) ?? "{}") as { peerUserId: string };
-      calls?.blockPosts.push(body.peerUserId);
-      calls?.blocked.add(body.peerUserId);
-      return jsonOk({ ok: true });
-    }
-    if (u.pathname.startsWith("/blocks/") && method === "DELETE") {
-      const peer = decodeURIComponent(u.pathname.slice("/blocks/".length));
-      calls?.blockDeletes.push(peer);
-      calls?.blocked.delete(peer);
-      return jsonOk({ ok: true });
-    }
-    if (u.pathname === "/blocks" && method === "GET") {
-      return jsonOk({ blocked: Array.from(calls?.blocked ?? []) });
     }
     return new Response(JSON.stringify({ error: "not_implemented", path: u.pathname }), {
       status: 501,
@@ -110,14 +88,13 @@ function btoaUrl(s: string): string {
 
 async function connectAlice(
   store: MemoryKVStore = new MemoryKVStore(),
-  calls?: MockServerCalls,
 ): Promise<DTelecomSecureChat> {
   return DTelecomSecureChat.connect({
     apiBaseURL: "http://test",
     fetchChatToken: async () => mintAlice(),
     store,
     crypto: new FakeCryptoAdapter(),
-    fetchImpl: makeMockFetch(calls),
+    fetchImpl: makeMockFetch(),
   });
 }
 
@@ -259,39 +236,87 @@ describe("DTelecomSecureChat — getHistory survives reconnect on same store", (
   });
 });
 
-describe("DTelecomSecureChat — block / unblock", () => {
-  function emptyCalls(): MockServerCalls {
-    return { blockPosts: [], blockDeletes: [], blocked: new Set() };
-  }
+// Block API was removed from the SDK in 0.3.0 — see index.ts: the host app's
+// existing user-block UX (e.g. dmeet's POST /api/users/block-user) already
+// mutates the rows the chat handlers query. The SDK only keeps an inbound
+// LOCAL filter (covered separately below) for messages arriving over Olm
+// sessions established BEFORE a block was set.
 
-  it("blockUser POSTs /blocks with the peer id", async () => {
-    const calls = emptyCalls();
-    const sdk = await connectAlice(new MemoryKVStore(), calls);
-    await sdk.blockUser("bob");
-    expect(calls.blockPosts).toEqual(["bob"]);
-    expect(calls.blocked.has("bob")).toBe(true);
+describe("DTelecomSecureChat — local inbound block filter", () => {
+  it("setBlockedUserIds + getLocallyBlockedUserIds roundtrip", async () => {
+    const sdk = await connectAlice(new MemoryKVStore());
+    expect(sdk.getLocallyBlockedUserIds()).toEqual([]);
+    await sdk.setBlockedUserIds(["bob", "carol"]);
+    expect(new Set(sdk.getLocallyBlockedUserIds())).toEqual(new Set(["bob", "carol"]));
+    await sdk.setBlockedUserIds(["dave"]); // replace, not append
+    expect(sdk.getLocallyBlockedUserIds()).toEqual(["dave"]);
     await sdk.disconnect();
   });
 
-  it("unblockUser DELETEs /blocks/:peerId", async () => {
-    const calls = emptyCalls();
-    const sdk = await connectAlice(new MemoryKVStore(), calls);
-    await sdk.blockUser("bob");
-    await sdk.unblockUser("bob");
-    expect(calls.blockDeletes).toEqual(["bob"]);
-    expect(calls.blocked.has("bob")).toBe(false);
+  it("persists across reconnects on the same store", async () => {
+    const kv = new MemoryKVStore();
+    const sdk1 = await connectAlice(kv);
+    await sdk1.setBlockedUserIds(["bob"]);
+    await sdk1.disconnect();
+
+    const sdk2 = await connectAlice(kv);
+    expect(sdk2.getLocallyBlockedUserIds()).toEqual(["bob"]);
+    await sdk2.disconnect();
+  });
+
+  it("initialBlockedUserIds option overrides whatever was on disk", async () => {
+    const kv = new MemoryKVStore();
+    const sdk1 = await connectAlice(kv);
+    await sdk1.setBlockedUserIds(["stale-entry"]);
+    await sdk1.disconnect();
+
+    const sdk2 = await DTelecomSecureChat.connect({
+      apiBaseURL: "http://test",
+      fetchChatToken: async () => mintAlice(),
+      store: kv,
+      crypto: new FakeCryptoAdapter(),
+      fetchImpl: makeMockFetch(),
+      initialBlockedUserIds: ["bob", "carol"],
+    });
+    expect(new Set(sdk2.getLocallyBlockedUserIds())).toEqual(new Set(["bob", "carol"]));
+    await sdk2.disconnect();
+  });
+});
+
+describe("DTelecomSecureChat — currentUserId + deleteConversation", () => {
+  it("currentUserId reflects the token's sub claim", async () => {
+    const sdk = await connectAlice(new MemoryKVStore());
+    expect(sdk.currentUserId).toBe("alice");
     await sdk.disconnect();
   });
 
-  it("getBlockedUsers reflects the server view", async () => {
-    const calls = emptyCalls();
-    const sdk = await connectAlice(new MemoryKVStore(), calls);
-    await sdk.blockUser("bob");
-    await sdk.blockUser("carol");
-    const list = await sdk.getBlockedUsers();
-    expect([...list].sort()).toEqual(["bob", "carol"]);
-    await sdk.unblockUser("bob");
-    expect(await sdk.getBlockedUsers()).toEqual(["carol"]);
+  it("deleteConversation wipes the thread + fires conversationsChanged", async () => {
+    const kv = new MemoryKVStore();
+    const sdk = await connectAlice(kv);
+
+    // Seed message rows directly — the SDK's send path is exercised by the
+    // smokes and requires a session, which the mocked test stack doesn't
+    // set up. The store layer is what deleteConversation has to clean up,
+    // so writing through it is the right unit under test.
+    const store = new MessageStore(kv);
+    await store.put({
+      id: "m1", peerUserId: "bob", senderUserId: "bob",
+      text: "hi", sentAt: 1_000, editedAt: null, deletedAt: null,
+    });
+    await store.put({
+      id: "m2", peerUserId: "bob", senderUserId: "alice",
+      text: "hi back", sentAt: 2_000, editedAt: null, deletedAt: null,
+    });
+    expect((await sdk.getHistory("bob")).map((m) => m.id)).toEqual(["m1", "m2"]);
+
+    const events: { changed: string[] }[] = [];
+    sdk.on("conversationsChanged", (e) => events.push(e));
+
+    await sdk.deleteConversation("bob");
+
+    expect(await sdk.getHistory("bob")).toEqual([]);
+    expect(events.some((e) => e.changed.includes("bob"))).toBe(true);
+
     await sdk.disconnect();
   });
 });

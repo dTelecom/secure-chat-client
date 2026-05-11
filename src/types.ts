@@ -106,12 +106,6 @@ export interface AckRequest {
   envelopeUuids: string[];
 }
 
-// ── HTTP (blocks) ────────────────────────────────────────────────────────────
-
-export interface BlocksListResponse {
-  blocked: string[];
-}
-
 // ── WebSocket frames (chat-wire-contract.md §3) ─────────────────────────────
 
 export type FrameKind =

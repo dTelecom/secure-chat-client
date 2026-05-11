@@ -141,6 +141,19 @@ export class MessageStore {
     return updated;
   }
 
+  /**
+   * Drop every message stored for `peerUserId` — KV rows AND in-memory
+   * cache, so subsequent `get`/`listForPeer` calls return nothing. Used
+   * by `chat.deleteConversation` for the "remove from list" UX.
+   */
+  async deleteForPeer(peerUserId: string): Promise<void> {
+    const msgs = await this.listForPeer(peerUserId);
+    for (const m of msgs) {
+      this.cache.delete(m.id);
+      await this.store.delete(this.kvKey(m.id));
+    }
+  }
+
   private kvKey(messageId: string): string {
     return `messages/${messageId}`;
   }

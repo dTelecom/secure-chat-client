@@ -11,7 +11,6 @@
 
 import type {
   AckRequest,
-  BlocksListResponse,
   ClaimAllResponse,
   KeyBundleUploadRequest,
   ListDevicesResponse,
@@ -196,21 +195,7 @@ export class HttpClient {
     return this.authedJson("POST", "/envelopes/ack", deviceId, body);
   }
 
-  // ── blocks ─────────────────────────────────────────────────────────────────
-
-  blockUser(deviceId: string, peerUserId: string): Promise<{ ok: true }> {
-    return this.authedJson("POST", "/blocks", deviceId, { peerUserId: peerUserId });
-  }
-
-  unblockUser(deviceId: string, peerUserId: string): Promise<{ ok: true }> {
-    return this.authedJson(
-      "DELETE",
-      `/blocks/${encodeURIComponent(peerUserId)}`,
-      deviceId,
-    );
-  }
-
-  listBlocked(deviceId: string): Promise<BlocksListResponse> {
-    return this.authedJson("GET", "/blocks", deviceId);
-  }
+  // Block list is intentionally NOT routed through this client. See
+  // index.ts for the rationale — dmeet-backend's existing user-block
+  // endpoints back the same UserToUserBlock rows the chat handlers query.
 }
