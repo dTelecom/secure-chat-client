@@ -71,9 +71,19 @@ function makeFetchToken(userId: string) {
 }
 
 async function makeSide(userId: string, deviceId: string) {
+  const fetchToken = makeFetchToken(userId);
+  let cached: { token: string; exp: number } | null = null;
+  const fetchHttpBearer = async (): Promise<string> => {
+    const now = Math.floor(Date.now() / 1000);
+    if (cached && cached.exp - now > 60) return cached.token;
+    const r = await fetchToken("smoke-transport-bearer");
+    cached = { token: r.chatToken, exp: r.expiresAt };
+    return r.chatToken;
+  };
   const http = new HttpClient({
     apiBaseURL: API_BASE_URL,
-    fetchChatToken: makeFetchToken(userId),
+    fetchChatToken: fetchToken,
+    fetchHttpBearer,
   });
 
   const nodeWsUrl = await http.getNodeWsUrl(deviceId);

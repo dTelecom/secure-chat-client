@@ -19,7 +19,7 @@
 // known gap rather than asserting auto-refill.
 
 import {
-  runSmoke, check, sdkConnect, mintTokenFor,
+  runSmoke, check, sdkConnect, mintTokenFor, bearerForMock,
   API_BASE_URL, resetMock, delay, waitFor,
 } from "./_smoke-helpers.js";
 import { HttpClient } from "../src/transport/http.js";
@@ -36,6 +36,7 @@ await runSmoke("smoke:otk-exhaustion", async () => {
   const drainerHttp = new HttpClient({
     apiBaseURL: API_BASE_URL,
     fetchChatToken: mintTokenFor(drainerUser),
+    fetchHttpBearer: bearerForMock(drainerUser),
   });
   // Make the drainer registered (mint a token under its user id so
   // /keys/claim_all auth passes).
@@ -49,6 +50,7 @@ await runSmoke("smoke:otk-exhaustion", async () => {
   const bobHttp = new HttpClient({
     apiBaseURL: API_BASE_URL,
     fetchChatToken: mintTokenFor(bobUser),
+    fetchHttpBearer: bearerForMock(bobUser),
   });
   const count = await bobHttp.otkCount(bob.deviceId);
   check("bob's OTK pool is empty after 100 claims", count.count === 0,
@@ -60,9 +62,11 @@ await runSmoke("smoke:otk-exhaustion", async () => {
   // Sanity: drive a separate raw client to inspect the claim response —
   // the SDK's HttpClient is private. The probe also pops one OTK had
   // there been any, so it's keyed by a different user id than alice.
+  const probeUser = `alice-otk-probe-${Date.now()}`;
   const aliceProbe = new HttpClient({
     apiBaseURL: API_BASE_URL,
-    fetchChatToken: mintTokenFor(`alice-otk-probe-${Date.now()}`),
+    fetchChatToken: mintTokenFor(probeUser),
+    fetchHttpBearer: bearerForMock(probeUser),
   });
   await aliceProbe.getMint("alice-probe-dev");
   const claim = await aliceProbe.claimAll("alice-probe-dev", bobUser);

@@ -72,6 +72,7 @@ describe("KeyBundleManager", () => {
     return new HttpClient({
       apiBaseURL: "http://test",
       fetchChatToken: async () => fakeMint(),
+      fetchHttpBearer: async () => "fake.bearer",
       fetchImpl: makeFetch({
         "POST /keys/upload": async (req) => {
           httpCalls.push({ method: req.method, path: "/keys/upload", body: await req.json() });
@@ -158,6 +159,7 @@ describe("SessionManager", () => {
     return new HttpClient({
       apiBaseURL: "http://test",
       fetchChatToken: async () => fakeMint(),
+      fetchHttpBearer: async () => "fake.bearer",
       fetchImpl: makeFetch({
         "POST /keys/claim_all": async () => {
           claimAllCalls++;
@@ -243,6 +245,7 @@ describe("PeerDeviceCache", () => {
     const http = new HttpClient({
       apiBaseURL: "http://test",
       fetchChatToken: async () => fakeMint(),
+      fetchHttpBearer: async () => "fake.bearer",
       fetchImpl: makeFetch({
         "GET /keys/list_devices": () => {
           calls++;

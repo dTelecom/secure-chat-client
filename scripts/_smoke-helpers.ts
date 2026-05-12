@@ -70,6 +70,26 @@ export function mintTokenFor(userId: string) {
   };
 }
 
+/**
+ * fetchHttpBearer for the in-memory mock — re-uses the chat JWT for the
+ * Authorization header on HTTP calls. The mock accepts that as a stand-in
+ * for the host's session bearer. The deviceId is irrelevant for the mock's
+ * auth, so we pass an empty string and just want the JWT.
+ *
+ * Against the real dmeet-backend a Privy access token would go here instead.
+ */
+export function bearerForMock(userId: string): () => Promise<string> {
+  const mint = mintTokenFor(userId);
+  let cached: { token: string; exp: number } | null = null;
+  return async () => {
+    const now = Math.floor(Date.now() / 1000);
+    if (cached && cached.exp - now > 60) return cached.token;
+    const r = await mint("smoke-bearer");
+    cached = { token: r.chatToken, exp: r.expiresAt };
+    return r.chatToken;
+  };
+}
+
 // ── Low-level WS client (for wire-level smokes) ─────────────────────────────
 
 export interface RawSide {
@@ -85,6 +105,7 @@ export async function rawConnect(userId: string, deviceId?: string): Promise<Raw
   const http = new HttpClient({
     apiBaseURL: API_BASE_URL,
     fetchChatToken: mintTokenFor(userId),
+    fetchHttpBearer: bearerForMock(userId),
   });
   const url = await http.getNodeWsUrl(dev);
   const baseUrl = url.replace(/\/chat\/ws\/?$/, "");
@@ -125,6 +146,7 @@ export async function sdkConnect(
   const sdk = await DTelecomSecureChat.connect({
     apiBaseURL: API_BASE_URL,
     fetchChatToken: mintTokenFor(userId),
+    fetchHttpBearer: bearerForMock(userId),
     store,
     crypto,
   });

@@ -26,11 +26,28 @@ import type {
  * Must return the full token-mint response so the SDK can use the
  * server-discovered node URL (chatNodeWsUrl) — no Solana code on the client.
  *
+ * **The returned `chatToken` is used by the SDK only on the WebSocket** to
+ * the dtelecom node (which can't verify Privy / host-app session tokens, so
+ * it needs a Solana-registry-signed JWT). HTTP authentication is independent
+ * — see `FetchHttpBearer` below.
+ *
  * The callback can implement `POST {apiBaseURL}/token` itself, OR call any
  * tenant-specific endpoint (e.g. one that wraps Privy auth) — the SDK
  * doesn't care, only the response shape matters.
  */
 export type FetchChatToken = (deviceId: string) => Promise<MintTokenResponse>;
+
+/**
+ * Consumer-supplied callback that returns a Bearer token the SDK can attach
+ * to every HTTP request to the tenant backend (`/keys/*`, `/envelopes/*`).
+ * In dmeet's case this is the Privy access token — exactly what every other
+ * `/api/*` route already expects. In the in-memory mock it can be the chat
+ * JWT (the mock accepts that as a stand-in for a real host bearer).
+ *
+ * Called once per request — let the host's session library do its own
+ * caching (Privy's `getAccessToken()` already caches + refreshes).
+ */
+export type FetchHttpBearer = () => Promise<string>;
 
 export interface HttpClientOptions {
   /**
@@ -42,8 +59,11 @@ export interface HttpClientOptions {
    *   "https://api.tenant.dev/v3/dtelecom-chat" (any custom mount point)
    */
   apiBaseURL: string;
-  /** Function returning a valid chat token JWT. Called when the SDK needs auth. */
+  /** Function returning the chat token + node WS URL. Used for the WS handshake
+   *  and to discover the dtelecom node URL. NOT used for HTTP auth. */
   fetchChatToken: FetchChatToken;
+  /** Function returning the bearer the SDK attaches to every HTTP request. */
+  fetchHttpBearer: FetchHttpBearer;
   /** Optional fetch implementation (defaults to globalThis.fetch). */
   fetchImpl?: typeof fetch;
 }
@@ -62,6 +82,7 @@ export class HttpError extends Error {
 export class HttpClient {
   private readonly apiBase: string;
   private readonly fetchToken: FetchChatToken;
+  private readonly fetchHttpBearer: FetchHttpBearer;
   private readonly fetchImpl: typeof fetch;
 
   // Cached MintTokenResponse, keyed by device id. Refreshed when expired.
@@ -71,6 +92,7 @@ export class HttpClient {
   constructor(opts: HttpClientOptions) {
     this.apiBase = opts.apiBaseURL.replace(/\/$/, "");
     this.fetchToken = opts.fetchChatToken;
+    this.fetchHttpBearer = opts.fetchHttpBearer;
     this.fetchImpl = opts.fetchImpl ?? globalThis.fetch.bind(globalThis);
   }
 
@@ -114,12 +136,15 @@ export class HttpClient {
   private async authedJson<T>(
     method: "GET" | "POST" | "DELETE",
     path: string,
-    deviceId: string,
+    _deviceId: string,
     body?: unknown,
   ): Promise<T> {
-    const token = await this.getToken(deviceId);
+    // HTTP auth = whatever the host returns from fetchHttpBearer (Privy bearer
+    // for dmeet; the chat JWT for the in-memory mock). The chat token from
+    // fetchChatToken is reserved for the WS handshake to the dtelecom node.
+    const bearer = await this.fetchHttpBearer();
     const headers: Record<string, string> = {
-      authorization: `Bearer ${token}`,
+      authorization: `Bearer ${bearer}`,
     };
     let bodyText: string | undefined;
     if (body !== undefined) {

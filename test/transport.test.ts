@@ -31,6 +31,9 @@ function fakeMint(): MintTokenResponse {
     chatNodeWsUrl: "wss://node.test/chat/ws",
   };
 }
+// HTTP bearer = a separate token in 0.4.0. Tests use the same FAKE_JWT to
+// keep assertions compact; the real frontend supplies a Privy access token.
+const fakeHttpBearer = async (): Promise<string> => FAKE_JWT;
 
 describe("HttpClient", () => {
   it("caches mint until close to expiry", async () => {
@@ -38,6 +41,7 @@ describe("HttpClient", () => {
     const client = new HttpClient({
       apiBaseURL: "http://test",
       fetchChatToken: fetchToken,
+      fetchHttpBearer: fakeHttpBearer,
       fetchImpl: makeFetch({}),
     });
     await client.getToken("dev1");
@@ -51,6 +55,7 @@ describe("HttpClient", () => {
     const client = new HttpClient({
       apiBaseURL: "http://test",
       fetchChatToken: fetchToken,
+      fetchHttpBearer: fakeHttpBearer,
       fetchImpl: makeFetch({}),
     });
     await client.getToken("dev1");
@@ -62,6 +67,7 @@ describe("HttpClient", () => {
     const client = new HttpClient({
       apiBaseURL: "http://test",
       fetchChatToken: async () => fakeMint(),
+      fetchHttpBearer: fakeHttpBearer,
       fetchImpl: makeFetch({}),
     });
     expect(await client.getNodeWsUrl("dev1")).toBe("wss://node.test/chat/ws");
@@ -71,6 +77,7 @@ describe("HttpClient", () => {
     const client = new HttpClient({
       apiBaseURL: "http://test",
       fetchChatToken: async () => ({ chatToken: "x", expiresAt: 0 } as MintTokenResponse),
+      fetchHttpBearer: fakeHttpBearer,
       fetchImpl: makeFetch({}),
     });
     await expect(client.getToken("d")).rejects.toThrow(/chatNodeWsUrl/);
@@ -82,6 +89,7 @@ describe("HttpClient", () => {
     const client = new HttpClient({
       apiBaseURL: "http://test",
       fetchChatToken: fetchToken,
+      fetchHttpBearer: fakeHttpBearer,
       fetchImpl: makeFetch({
         "GET /keys/count": (req) => {
           seen.push(req.headers.get("authorization") ?? "");
@@ -100,6 +108,7 @@ describe("HttpClient", () => {
     const client = new HttpClient({
       apiBaseURL: "http://test",
       fetchChatToken: async () => fakeMint(),
+      fetchHttpBearer: fakeHttpBearer,
       fetchImpl: makeFetch({
         "POST /keys/upload": () =>
           new Response(JSON.stringify({ error: "invalid_bundle", message: "bad signature" }), {
@@ -144,6 +153,7 @@ describe("HttpClient", () => {
     const client = new HttpClient({
       apiBaseURL: "http://test",
       fetchChatToken: async () => fakeMint(),
+      fetchHttpBearer: fakeHttpBearer,
       fetchImpl: makeFetch({
         "POST /keys/upload": recordHandler(),
         "POST /keys/topup": recordHandler(200, { ok: true, currentCount: 5 }),

@@ -13,6 +13,7 @@ import {
   check,
   sdkConnect,
   mintTokenFor,
+  bearerForMock,
   API_BASE_URL,
   uuid,
   delay,
@@ -52,7 +53,7 @@ await runSmoke("smoke:crash-recovery", async () => {
   // Step 1: pretend bob's tab opened, pulled, but crashed before acking.
   // We use a raw HttpClient with bob's identity to read pending — and
   // never call ack.
-  const bobHttp = new HttpClient({ apiBaseURL: API_BASE_URL, fetchChatToken: mintTokenFor(bobUser) });
+  const bobHttp = new HttpClient({ apiBaseURL: API_BASE_URL, fetchChatToken: mintTokenFor(bobUser), fetchHttpBearer: bearerForMock(bobUser) });
   const pending1 = await bobHttp.pending(bobDev);
   check("bob's first pull returns the envelope", pending1.envelopes.length >= 1,
     `pending: ${JSON.stringify(pending1.envelopes.map((e) => e.envelopeUuid))}`);

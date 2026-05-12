@@ -92,6 +92,7 @@ async function connectAlice(
   return DTelecomSecureChat.connect({
     apiBaseURL: "http://test",
     fetchChatToken: async () => mintAlice(),
+    fetchHttpBearer: async () => "fake.bearer",
     store,
     crypto: new FakeCryptoAdapter(),
     fetchImpl: makeMockFetch(),
@@ -273,6 +274,7 @@ describe("DTelecomSecureChat — local inbound block filter", () => {
     const sdk2 = await DTelecomSecureChat.connect({
       apiBaseURL: "http://test",
       fetchChatToken: async () => mintAlice(),
+      fetchHttpBearer: async () => "fake.bearer",
       store: kv,
       crypto: new FakeCryptoAdapter(),
       fetchImpl: makeMockFetch(),

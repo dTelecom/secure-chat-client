@@ -10,7 +10,7 @@
 // directly + the deployed mesh.
 
 import { Account } from "@dtelecom/vodozemac-wasm";
-import { runSmoke, check, sdkConnect, mintTokenFor, API_BASE_URL, uuid, waitFor, delay } from "./_smoke-helpers.js";
+import { runSmoke, check, sdkConnect, mintTokenFor, bearerForMock, API_BASE_URL, uuid, waitFor, delay } from "./_smoke-helpers.js";
 import { HttpClient } from "../src/transport/http.js";
 import { WsClient } from "../src/transport/ws.js";
 import type { ChatEnvelopeFrame, InboundFrame } from "../src/types.js";
@@ -29,7 +29,7 @@ await runSmoke("smoke:fwd-compat", async () => {
   // session with vodozemac, encrypt a v=2 plaintext, send chatSend frame.
   const aliceUserId = `alice-fwd-${Date.now()}`;
   const aliceDeviceId = `alice-${uuid().slice(0, 8)}`;
-  const http = new HttpClient({ apiBaseURL: API_BASE_URL, fetchChatToken: mintTokenFor(aliceUserId) });
+  const http = new HttpClient({ apiBaseURL: API_BASE_URL, fetchChatToken: mintTokenFor(aliceUserId), fetchHttpBearer: bearerForMock(aliceUserId) });
   const claim = await http.claimAll(aliceDeviceId, bob.userId);
   if (claim.devices.length === 0) {
     throw new Error("claim_all returned 0 devices for bob");

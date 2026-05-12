@@ -4,7 +4,16 @@ TypeScript SDK for end-to-end encrypted 1:1 chat over the dTelecom mesh. Olm via
 
 ## Status
 
-v0.3.0 — feature complete.
+v0.4.0 — feature complete.
+
+> **v0.4.0 breaking change vs v0.3.0:** HTTP and WS auth are now **separate**. The chat token from `fetchChatToken` is reserved for the dtelecom-node WS handshake; HTTP requests use a new required `fetchHttpBearer` callback (for dmeet this is the Privy access token — same bearer every other `/api/*` route already expects). The previous design (re-using the chat token for HTTP) only worked against the in-memory mock — the dmeet-backend HTTP routes use Privy auth, so 0.3.0 couldn't actually talk to a real backend. Update consumers:
+> ```diff
+>  const chat = await DTelecomSecureChat.connect({
+>    apiBaseURL: "https://app.example/api/secure-chat",
+>    fetchChatToken: async (deviceId) => { /* mint endpoint */ },
+> +  fetchHttpBearer: async () => getPrivyAccessToken(),
+>  });
+> ```
 
 > **v0.3.0 changes vs v0.2.0:**
 > - **Add** `chat.listConversations()` + the `conversationsChanged` event — a per-peer threads index derived from the local message store + a per-peer read watermark, persisted via the configured KV adapter. Unread counts converge across own devices because `markRead` self-echoes.
@@ -42,12 +51,20 @@ const chat = await DTelecomSecureChat.connect({
   fetchChatToken: async (deviceId) => {
     // Call your tenant backend; it should mint a chat-token JWT
     // signed with the tenant wallet (Ed25519 via Solana registry).
+    // The returned chatToken is used ONLY on the WebSocket to the
+    // dtelecom node — it doesn't auth the HTTP API (see fetchHttpBearer).
     const r = await fetch("/api/secure-chat/token", {
       method: "POST",
+      headers: { Authorization: `Bearer ${await getPrivyAccessToken()}` },
       body: JSON.stringify({ deviceId }),
     });
     return r.json(); // { chatToken, chatNodeWsUrl, expiresAt }
   },
+  // The bearer for every HTTP request to the tenant backend (`/keys/*`,
+  // `/envelopes/*`). For dmeet this is the Privy access token — exactly
+  // what every other `/api/*` route already accepts. Called per-request;
+  // let the host's session library handle caching/refresh.
+  fetchHttpBearer: async () => getPrivyAccessToken(),
   // Optional. The current user-block set, sourced from your host backend
   // (e.g. dmeet's /api/users/block-user UX). Inbound messages from these
   // peers arriving over a previously-established Olm session are dropped

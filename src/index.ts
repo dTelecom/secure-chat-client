@@ -29,7 +29,8 @@ import { SessionManager } from "./sessions.js";
 import { StatusTracker, type MessageStatus } from "./status.js";
 import type { KVStore } from "./store/interface.js";
 import { WebKVStore } from "./store/web-adapter.js";
-import { HttpClient, type FetchChatToken } from "./transport/http.js";
+import { HttpClient, type FetchChatToken, type FetchHttpBearer } from "./transport/http.js";
+export type { FetchChatToken, FetchHttpBearer } from "./transport/http.js";
 import { WsClient } from "./transport/ws.js";
 import { TypingManager } from "./typing.js";
 import type { ChatSendResult, ChatSendTarget, InboundFrame } from "./types.js";
@@ -42,10 +43,18 @@ export const CONTENT_PROTOCOL_VERSION = _CONTENT_VERSION;
 export interface ConnectOptions {
   /** dmeet-backend (or mock) base URL — e.g. https://dmeet.example.com */
   apiBaseURL: string;
-  /** Function that mints a chat token. The SDK calls this whenever a fresh
-   *  token is needed; the consumer's implementation handles their own
-   *  outer auth (Privy, an internal cookie, etc.). */
+  /** Function that mints a chat token + returns the closest dtelecom node WS
+   *  URL. The token is used ONLY on the WebSocket handshake (the dtelecom
+   *  node can't verify Privy tokens — it needs the Solana-registry-signed
+   *  JWT). The HTTP API uses a separate bearer — see `fetchHttpBearer`. */
   fetchChatToken: FetchChatToken;
+  /** Function returning the bearer the SDK attaches to every HTTP request
+   *  to the tenant backend (`/keys/*`, `/envelopes/*`). For dmeet this is
+   *  the Privy access token — exactly what every other `/api/*` route
+   *  expects. For the in-memory mock this can be the chat JWT (the mock
+   *  accepts that). Called once per HTTP request — let the host's session
+   *  library handle caching/refresh. */
+  fetchHttpBearer: FetchHttpBearer;
   /** Optional. Defaults to WebKVStore (IndexedDB) in browsers. Tests pass
    *  MemoryKVStore to avoid the IDB dependency. */
   store?: KVStore;
@@ -512,6 +521,7 @@ export class DTelecomSecureChat {
     this.http = new HttpClient({
       apiBaseURL: opts.apiBaseURL,
       fetchChatToken: opts.fetchChatToken,
+      fetchHttpBearer: opts.fetchHttpBearer,
       ...(opts.fetchImpl ? { fetchImpl: opts.fetchImpl } : {}),
     });
 
