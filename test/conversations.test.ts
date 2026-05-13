@@ -139,4 +139,22 @@ describe("ConversationIndex", () => {
     expect(out[0].unreadCount).toBe(0);
     expect(out[0].lastMessage?.deletedAt).toBe(150);
   });
+
+  it("totalUnread sums unread across all peers", async () => {
+    // bob: 2 unread, carol: 1 unread, dave: own-authored (counts as read).
+    await storeMsg(h.msgs, { id: "b1", peerUserId: "bob", senderUserId: "bob", sentAt: 100 });
+    await h.idx.onMessageStored({ peerUserId: "bob", senderUserId: "bob", messageId: "b1", sentAt: 100 });
+    await storeMsg(h.msgs, { id: "b2", peerUserId: "bob", senderUserId: "bob", sentAt: 200 });
+    await h.idx.onMessageStored({ peerUserId: "bob", senderUserId: "bob", messageId: "b2", sentAt: 200 });
+    await storeMsg(h.msgs, { id: "c1", peerUserId: "carol", senderUserId: "carol", sentAt: 50 });
+    await h.idx.onMessageStored({ peerUserId: "carol", senderUserId: "carol", messageId: "c1", sentAt: 50 });
+    await storeMsg(h.msgs, { id: "d1", peerUserId: "dave", senderUserId: SELF, sentAt: 300 });
+    await h.idx.onMessageStored({ peerUserId: "dave", senderUserId: SELF, messageId: "d1", sentAt: 300 });
+
+    expect(await h.idx.totalUnread()).toBe(3);
+
+    // After reading bob's thread up through b1, only b2 + c1 remain unread.
+    await h.idx.markReadUpTo("bob", 100);
+    expect(await h.idx.totalUnread()).toBe(2);
+  });
 });

@@ -24,6 +24,10 @@ export interface OutboxOptions {
   maxAttempts?: number;
   /** Base backoff (ms) — actual is base * 2^attempts ± 20% jitter. */
   baseBackoffMs?: number;
+  /** Fired once when an entry has exhausted its retry budget and is being
+   *  discarded. The SDK uses this to write `status: "failed"` to the stored
+   *  message and emit a `messageSendFailed` event to the app. */
+  onTerminalFailure?: (entry: OutboxEntry) => void;
 }
 
 const DEFAULT_MAX_ATTEMPTS = 5;
@@ -39,12 +43,17 @@ const DEFAULT_BASE_BACKOFF = 500;
 export class Outbox {
   private queue: OutboxEntry[] = [];
   private inflightIds = new Set<string>();
-  private opts: Required<OutboxOptions>;
+  private opts: {
+    maxAttempts: number;
+    baseBackoffMs: number;
+    onTerminalFailure?: (entry: OutboxEntry) => void;
+  };
 
   constructor(opts: OutboxOptions = {}) {
     this.opts = {
       maxAttempts: opts.maxAttempts ?? DEFAULT_MAX_ATTEMPTS,
       baseBackoffMs: opts.baseBackoffMs ?? DEFAULT_BASE_BACKOFF,
+      ...(opts.onTerminalFailure ? { onTerminalFailure: opts.onTerminalFailure } : {}),
     };
   }
 
@@ -89,6 +98,11 @@ export class Outbox {
       if (entry.attempts >= this.opts.maxAttempts) {
         this.inflightIds.delete(entry.messageId);
         completed++;
+        try {
+          this.opts.onTerminalFailure?.(entry);
+        } catch {
+          // Listener errors must not break the outbox loop.
+        }
         continue;
       }
       entry.nextRetryAt = now + this.computeBackoff(entry.attempts);

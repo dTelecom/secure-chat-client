@@ -145,6 +145,39 @@ export interface PeerNewDeviceEvt {
  */
 export interface ConversationsChangedEvt {
   changed: string[];
+  /** Sum of `unreadCount` across every conversation, including ones not in
+   *  `changed`. Lets the chat tab badge update from a single listener
+   *  without re-walking listConversations(). */
+  totalUnread: number;
+}
+
+/**
+ * Fired exactly once per outbound message when the SDK gives up retrying.
+ * The stored row's `status` is also written to `"failed"` so the UI can
+ * render a "failed" indicator after reload. Apps can show a "retry" button
+ * — the right way to retry is to call `chat.sendText(...)` with the same
+ * text again; this creates a new `messageId` (the failed one stays in
+ * history with `status: "failed"` and the user can delete it locally).
+ */
+export interface MessageSendFailedEvt {
+  peerUserId: string;
+  messageId: string;
+  reason: "max_attempts_exceeded";
+}
+
+/**
+ * Typed error thrown by methods that have explicit, recoverable failure
+ * modes the host app should distinguish from generic exceptions. Right now
+ * the only code is `"peer_unreachable"` (see `sendText`).
+ */
+export class ChatError extends Error {
+  constructor(
+    public code: "peer_unreachable",
+    message: string,
+  ) {
+    super(message);
+    this.name = "ChatError";
+  }
 }
 
 /**
@@ -169,6 +202,7 @@ interface EventMap {
   peerNewDevice: PeerNewDeviceEvt;
   conversationsChanged: ConversationsChangedEvt;
   connectionStateChange: ConnectionStateChangedEvt;
+  messageSendFailed: MessageSendFailedEvt;
 }
 
 type EventName = keyof EventMap;
@@ -206,7 +240,24 @@ export class DTelecomSecureChat {
   private messages!: MessageStore;
   private conversations!: ConversationIndex;
   private status!: StatusTracker;
-  private outbox = new Outbox();
+  private outbox = new Outbox({
+    onTerminalFailure: (entry) => {
+      // Outbox gave up. Persist status:"failed" so the UI can render a
+      // failed indicator after reload, then fire the event so apps can
+      // surface a "couldn't send" toast immediately.
+      void (async () => {
+        const msg = await this.messages.get(entry.messageId);
+        if (msg && this.selfUserId !== null && msg.senderUserId === this.selfUserId) {
+          await this.messages.put({ ...msg, status: "failed" });
+        }
+        this.dispatch("messageSendFailed", {
+          peerUserId: entry.peerUserId,
+          messageId: entry.messageId,
+          reason: "max_attempts_exceeded",
+        });
+      })();
+    },
+  });
   private typingMgr!: TypingManager;
   private listeners = new Map<EventName, Set<(event: unknown) => void>>();
 
@@ -273,6 +324,7 @@ export class DTelecomSecureChat {
         sentAt: event.clientSentAt,
         editedAt: null,
         deletedAt: null,
+        status: "pending", // bumps to "sent"/"delivered"/"read"/"failed" via the StatusTracker hook
         ...(event.replyTo !== undefined ? { replyTo: event.replyTo } : {}),
       });
       await this.bumpConversation({
@@ -471,7 +523,14 @@ export class DTelecomSecureChat {
   async deleteConversation(peerUserId: string): Promise<void> {
     await this.messages.deleteForPeer(peerUserId);
     await this.conversations.delete(peerUserId);
-    this.dispatch("conversationsChanged", { changed: [peerUserId] });
+    await this.emitConversationsChanged([peerUserId]);
+  }
+
+  /** Current sum of unread messages across every conversation. Use in the
+   *  app's nav-level badge; subscribe to `conversationsChanged` for live
+   *  updates (the event payload also carries this same value). */
+  getTotalUnreadCount(): Promise<number> {
+    return this.conversations.totalUnread();
   }
 
   // ── internals: block-list persistence ──────────────────────────────────────
@@ -554,6 +613,18 @@ export class DTelecomSecureChat {
     }
     this.status = new StatusTracker();
     this.status.on((messageId, status, peerUserId) => {
+      // Mirror the transition into the persisted message row so the
+      // last-known status survives reload. Inbound rows have a different
+      // senderUserId (the peer) so we skip them — status only applies to
+      // OUR outbound text. Edits/deletes track status separately under
+      // their own event id which isn't in MessageStore, so .get() returns
+      // null and we just emit the event without persistence.
+      void (async () => {
+        const msg = await this.messages.get(messageId);
+        if (msg && this.selfUserId !== null && msg.senderUserId === this.selfUserId) {
+          await this.messages.put({ ...msg, status });
+        }
+      })();
       this.dispatch("statusChange", { peerUserId, messageId, status });
     });
 
@@ -781,7 +852,7 @@ export class DTelecomSecureChat {
   }): Promise<void> {
     const changed = await this.conversations.onMessageStored(opts);
     if (changed) {
-      this.dispatch("conversationsChanged", { changed: [opts.peerUserId] });
+      await this.emitConversationsChanged([opts.peerUserId]);
     }
   }
 
@@ -795,8 +866,15 @@ export class DTelecomSecureChat {
     if (!target) return;
     const changed = await this.conversations.markReadUpTo(peerUserId, target.sentAt);
     if (changed) {
-      this.dispatch("conversationsChanged", { changed: [peerUserId] });
+      await this.emitConversationsChanged([peerUserId]);
     }
+  }
+
+  /** Central dispatch for `conversationsChanged` — always computes the
+   *  current `totalUnread` so the badge updates from a single listener. */
+  private async emitConversationsChanged(changed: string[]): Promise<void> {
+    const totalUnread = await this.conversations.totalUnread();
+    this.dispatch("conversationsChanged", { changed, totalUnread });
   }
 
   private async dispatchInboundEvent(
@@ -1053,7 +1131,15 @@ export class DTelecomSecureChat {
           }
         }
       }
-      return;
+      // Ephemerals (typing) silently fail — re-delivering a stale "X is
+      // typing" hours later is worse than dropping it. Persistent events
+      // throw so the host app can surface a "user can't be reached" UX
+      // (gated on `err.code === "peer_unreachable"`).
+      if (opts.ephemeral) return;
+      throw new ChatError(
+        "peer_unreachable",
+        `peer ${peerUserId} has no chat-registered devices (claim_all returned empty)`,
+      );
     }
     const targets: ChatSendTarget[] = encrypted.map((e) => ({
       deviceId: e.peerDeviceId,

@@ -4,7 +4,13 @@ TypeScript SDK for end-to-end encrypted 1:1 chat over the dTelecom mesh. Olm via
 
 ## Status
 
-v0.4.0 — feature complete.
+v0.5.0 — feature complete.
+
+> **v0.5.0 changes vs v0.4.0:**
+> - **Persisted message status.** `StoredMessage.status` is now mirrored from the in-memory `StatusTracker` on every `statusChange`, so last-known delivery state ("sent" / "delivered" / "read") survives reload. After reload, `getHistory()` returns the message with its last status; further updates still fire `statusChange` if more events arrive.
+> - **`messageSendFailed` event.** Fires once when the outbox exhausts its retry budget for a message. The stored row's `status` is also written to `"failed"` so the UI can render a failed indicator after reload. Reason: `"max_attempts_exceeded"`.
+> - **`sendText` throws `ChatError("peer_unreachable", …)`** when `claim_all` returns no devices (peer hasn't registered any chat-capable device, OR the peer has blocked the caller — server-side block enforcement). Previously silent. `ChatError` class is exported. Typing/ephemerals still silently drop.
+> - **`chat.getTotalUnreadCount()`** + **`totalUnread`** field on `conversationsChanged` event — the nav-level badge now updates from a single listener without re-walking `listConversations()`.
 
 > **v0.4.0 breaking change vs v0.3.0:** HTTP and WS auth are now **separate**. The chat token from `fetchChatToken` is reserved for the dtelecom-node WS handshake; HTTP requests use a new required `fetchHttpBearer` callback (for dmeet this is the Privy access token — same bearer every other `/api/*` route already expects). The previous design (re-using the chat token for HTTP) only worked against the in-memory mock — the dmeet-backend HTTP routes use Privy auth, so 0.3.0 couldn't actually talk to a real backend. Update consumers:
 > ```diff

@@ -230,6 +230,16 @@ export class ConversationIndex {
     return this.cache.get(peerUserId);
   }
 
+  /** Sum of `unreadCount` across every conversation. Computed by delegating
+   *  to `list()` so we stay in lockstep with whatever the public view shows.
+   *  O(n_messages) for now; cache later if it becomes a hot path. */
+  async totalUnread(): Promise<number> {
+    const list = await this.list();
+    let total = 0;
+    for (const c of list) total += c.unreadCount;
+    return total;
+  }
+
   /**
    * Drop the conversation row for `peerUserId` — both KV and in-memory
    * cache. Used by `chat.deleteConversation`.

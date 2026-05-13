@@ -358,6 +358,49 @@ describe("Outbox", () => {
       vi.useRealTimers();
     }
   });
+
+  it("fires onTerminalFailure with the discarded entry", async () => {
+    vi.useFakeTimers();
+    try {
+      const failed: string[] = [];
+      const outbox = new Outbox({
+        baseBackoffMs: 1,
+        maxAttempts: 2,
+        onTerminalFailure: (entry) => {
+          failed.push(entry.messageId);
+        },
+      });
+      outbox.enqueue({
+        messageId: "m1",
+        peerUserId: "bob",
+        ephemeral: false,
+        attempt: async () => new Map([["e1", "error"]]),
+      });
+      await outbox.tick();
+      vi.advanceTimersByTime(500);
+      await outbox.tick();
+      expect(failed).toEqual(["m1"]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("onTerminalFailure is NOT fired on success", async () => {
+    const failed: string[] = [];
+    const outbox = new Outbox({
+      onTerminalFailure: (entry) => {
+        failed.push(entry.messageId);
+      },
+    });
+    outbox.enqueue({
+      messageId: "m1",
+      peerUserId: "bob",
+      ephemeral: false,
+      attempt: async () => new Map([["e1", "live"]]),
+    });
+    await outbox.tick();
+    expect(failed).toEqual([]);
+  });
 });
 
 // ── TypingManager ───────────────────────────────────────────────────────────

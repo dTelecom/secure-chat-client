@@ -1,22 +1,26 @@
 // Sender-side per-message status state machine.
 //
+//   pending       : queued in the outbox, no result yet.
 //   sent          : the local node accepted at least one target's chatSend
 //                   (chatSendResult: live | stored).
 //   delivered     : at least one peer device returned a `received` event.
 //   deliveredAll  : every peer device the sender knows about returned
 //                   `received`.
 //   read          : a `read` event with upToId >= this message arrived.
+//   failed        : Outbox gave up after max retries. Terminal — no further
+//                   transitions for this messageId.
 //
-// The tracker is in-memory only — status is reconstructable from the
-// store + events on next connect. The SDK emits `statusChange` to the app
-// on every transition.
+// The tracker itself is in-memory; the SDK mirrors every transition into
+// `StoredMessage.status` (see message_store.ts) so the last-known state
+// survives reload.
 
 export type MessageStatus =
   | "pending"
   | "sent"
   | "delivered"
   | "deliveredAll"
-  | "read";
+  | "read"
+  | "failed";
 
 interface Outbound {
   messageId: string;
@@ -171,5 +175,10 @@ function rank(s: MessageStatus): number {
       return 3;
     case "read":
       return 4;
+    case "failed":
+      // Terminal but orthogonal to the delivery ladder — `bump` should
+      // never set "failed", that's the SDK's job via a separate code path.
+      // Give it a sentinel rank so a stray bump can't downgrade `read`.
+      return 99;
   }
 }

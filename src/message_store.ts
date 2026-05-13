@@ -6,6 +6,7 @@
 // In-memory + KV-backed. Keys are prefixed under "messages/<peerUserId>/<id>".
 
 import type { KVStore } from "./store/interface.js";
+import type { MessageStatus } from "./status.js";
 
 /**
  * Persisted shape of a message. `senderUserId` is the truth — the SDK
@@ -25,6 +26,13 @@ export interface StoredMessage {
   /** Set on delete; the message becomes a tombstone. */
   deletedAt: number | null;
   replyTo?: string;
+  /** Sender-side delivery status, mirrored from `StatusTracker` so the
+   *  last-known state survives reload. `undefined` on inbound messages
+   *  (status is the sender's view; it doesn't apply to messages we
+   *  received). For outbound: starts at `"pending"`, advances to
+   *  `"sent"` → `"delivered"` → `"deliveredAll"` → `"read"`. Terminal
+   *  `"failed"` is set when the outbox gives up after max retries. */
+  status?: MessageStatus;
 }
 
 export class MessageStore {
