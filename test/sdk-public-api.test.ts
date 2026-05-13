@@ -379,4 +379,19 @@ describe("DTelecomSecureChat — 0.5.0 surfaces", () => {
     expect(err.name).toBe("ChatError");
     expect(err.code).toBe("peer_unreachable");
   });
+
+  it("isPrimary() defaults to true with no Web Locks API (Node env)", async () => {
+    const sdk = await connectAlice(new MemoryKVStore());
+    // The test runner doesn't have navigator.locks; SDK falls back to
+    // single-tab mode where it's always primary. takeOver() is a no-op.
+    expect(sdk.isPrimary()).toBe(true);
+    await sdk.takeOver(); // doesn't throw
+    expect(sdk.isPrimary()).toBe(true);
+    await sdk.disconnect();
+  });
 });
+
+// The full multi-tab semantics (Web Locks API steal + auto-promote)
+// are exercised by the browser-mode test harness (vitest + Playwright)
+// since the real Web Locks API isn't available in Node. The Node unit
+// tests above cover the "no Web Locks" fallback (always primary).

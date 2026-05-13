@@ -166,6 +166,36 @@ export interface MessageSendFailedEvt {
 }
 
 /**
+ * Emitted whenever this SDK instance changes its "primary tab" role.
+ *
+ * - `role: "secondary"` — another tab of the same `(origin, user)` is the
+ *   active SDK instance. This tab's WebSocket is closed; local reads
+ *   (`listConversations`, `getHistory`) still work, but outbound sends
+ *   queue in the outbox and ultimately fail with `messageSendFailed`
+ *   because the WS never opens. The frontend should render an "open
+ *   elsewhere" overlay with a "Use here" button that calls
+ *   `chat.takeOver()` to steal primary status.
+ * - `role: "primary"` — this tab owns the WebSocket and the chat state.
+ *   Render normal UX.
+ *
+ * The SDK arrives in `primary` automatically when no other tab holds the
+ * lock; you only need a `tabConflict` listener if you support multi-tab
+ * users (which any real app does). Fires:
+ * - Once at boot if `connect()` discovers another tab is primary.
+ * - When this tab gets stolen-from (another tab called `takeOver`).
+ * - When this tab promotes (either via `takeOver` here, or because the
+ *   previous primary disconnected and our background wait fired).
+ *
+ * On browsers without the Web Locks API, the SDK behaves as if always
+ * primary — no `tabConflict` events fire and `takeOver` is a no-op.
+ */
+export interface TabConflictEvt {
+  role: "primary" | "secondary";
+  /** ms-epoch of this transition. Useful for "active since X" UI. */
+  activeAt: number;
+}
+
+/**
  * Typed error thrown by methods that have explicit, recoverable failure
  * modes the host app should distinguish from generic exceptions. Right now
  * the only code is `"peer_unreachable"` (see `sendText`).
@@ -203,6 +233,7 @@ interface EventMap {
   conversationsChanged: ConversationsChangedEvt;
   connectionStateChange: ConnectionStateChangedEvt;
   messageSendFailed: MessageSendFailedEvt;
+  tabConflict: TabConflictEvt;
 }
 
 type EventName = keyof EventMap;
@@ -226,6 +257,19 @@ export interface KnownPeerDevice {
 
 function verifiedKey(peerUserId: string, peerDeviceId: string): string {
   return `verifiedDevice/${peerUserId}/${peerDeviceId}`;
+}
+
+/**
+ * True when the Web Locks API is available — required for multi-tab
+ * coordination. Falls back to "always primary" in environments without it
+ * (Node tests, deeply old browsers).
+ */
+function hasWebLocks(): boolean {
+  return (
+    typeof globalThis !== "undefined" &&
+    typeof (globalThis as { navigator?: { locks?: unknown } }).navigator !== "undefined" &&
+    typeof (globalThis as { navigator?: { locks?: unknown } }).navigator?.locks !== "undefined"
+  );
 }
 
 export class DTelecomSecureChat {
@@ -274,6 +318,16 @@ export class DTelecomSecureChat {
   private bundleReuploadAttempted = false;
   /** Cache of the read-receipts preference (loaded lazily). */
   private readReceiptsCache: boolean | null = null;
+
+  // ── multi-tab coordination ────────────────────────────────────────────────
+  // Web Locks API mediates: only the tab holding `lockName` runs the WS +
+  // wire-side bootstrap. Other tabs wait silently as `secondary`. See
+  // `acquireLockOrWait`, `armBackgroundLockWait`, `demoteFromPrimary`.
+  private isPrimaryFlag = true; // default true so single-tab / no-Web-Locks works unchanged
+  private lockName: string | null = null;
+  /** Resolves the held-lock callback, releasing the lock so other tabs
+   *  can promote. Called from `disconnect()`. */
+  private releaseHeldLock: (() => void) | null = null;
   /** Locally-enforced inbound block list. Source of truth lives in the host
    *  app (e.g. dmeet's user-block table). The SDK only needs to know it so
    *  inbound messages from a now-blocked peer over an EXISTING Olm session
@@ -306,6 +360,28 @@ export class DTelecomSecureChat {
    *  disconnected without ever connecting (shouldn't happen in practice). */
   get currentUserId(): string | null {
     return this.selfUserId;
+  }
+
+  /** Sync getter — true iff this tab currently owns the chat WebSocket
+   *  and is processing live mesh traffic. False means another tab of the
+   *  same `(origin, user)` is primary. */
+  isPrimary(): boolean {
+    return this.isPrimaryFlag;
+  }
+
+  /**
+   * Forcibly steal primary status from whichever other tab currently holds
+   * it. On browsers with the Web Locks API: opens a new WS in this tab,
+   * closes the WS in the previous primary (which gets a
+   * `tabConflict { role: "secondary" }` event). Resolves once this tab's
+   * WS is open and ready. On browsers without Web Locks (very old) or
+   * environments without `navigator` (Node) this is a no-op resolution.
+   */
+  async takeOver(): Promise<void> {
+    if (this.isPrimaryFlag) return;
+    if (!this.lockName) return;
+    if (!hasWebLocks()) return;
+    await this.stealAndActivate(this.lockName);
   }
 
   // ── public API: messaging ──────────────────────────────────────────────────
@@ -566,6 +642,12 @@ export class DTelecomSecureChat {
     this.typingMgr.shutdown();
     this.flushReceivedBatch();
     await this.ws.close();
+    // Release the cross-tab lock so a secondary tab can promote itself.
+    // Safe to call when not actually holding (no-op).
+    if (this.releaseHeldLock) {
+      this.releaseHeldLock();
+      this.releaseHeldLock = null;
+    }
   }
 
   // ── internals ──────────────────────────────────────────────────────────────
@@ -585,11 +667,16 @@ export class DTelecomSecureChat {
     });
 
     // Seed the token cache and capture our self user id from the claims.
+    // This call is idempotent across tabs (the server doesn't care which
+    // tab minted it), so it's safe to do BEFORE the lock acquisition.
     const mint = await this.http.getMint(this.deviceId);
     this.selfUserId = parseSubFromJwt(mint.chatToken);
+    this.lockName = `dtelecom-chat:${opts.apiBaseURL}:${this.selfUserId ?? "anon"}`;
 
     this.keyBundle = new KeyBundleManager({ http: this.http, crypto: this.crypto, deviceId: this.deviceId });
-    await this.keyBundle.ensureKeyBundle();
+    // Note: ensureKeyBundle is moved into activatePrimary — secondary tabs
+    // skip it (the primary tab uploads the bundle; secondary doesn't write
+    // server state).
 
     this.sessions = new SessionManager({
       http: this.http,
@@ -633,8 +720,9 @@ export class DTelecomSecureChat {
       this.sendContent(peerUserId, newTyping(state), { ephemeral: true }).catch(() => {});
     });
 
-    // Connect WS to the discovered node URL. Strip a trailing /chat/ws
-    // path if the discovery returned one — WsClient appends it.
+    // Construct the WS client BUT don't connect it yet — connection is
+    // gated on primary-tab status. Strip a trailing /chat/ws path if the
+    // discovery returned one; WsClient appends it.
     const nodeUrl = mint.chatNodeWsUrl.replace(/\/chat\/ws\/?$/, "");
     this.ws = new WsClient({
       nodeBaseURL: nodeUrl,
@@ -642,24 +730,157 @@ export class DTelecomSecureChat {
       onFrame: (f) => this.onFrame(f),
       onState: (s) => this.onWsState(s),
     });
-    await this.ws.connect();
 
-    // Drain any offline envelopes that landed while we were away.
-    await this.drainPending();
-
-    // Refill OTKs if the server-side count has dropped below the
-    // watermark. Best-effort — failure here doesn't block bootstrap.
-    void this.keyBundle.topUpIfNeeded().catch(() => {});
-
-    // Pre-populate the session bundle cache for our OWN user so the
-    // first self-echo from this device fanouts to all currently-
-    // registered own devices. Without this, the first send-after-
-    // boot would self-echo to nobody (cache miss → claim_all on
-    // demand only happens at first send to selfUserId, which is
-    // also the moment we'd need it).
-    if (this.selfUserId) {
-      void this.sessions.refreshPeerBundles(this.selfUserId).catch(() => {});
+    // Acquire (or fail to acquire) the cross-tab lock. If we're primary,
+    // activatePrimary uploads keys + opens the WS. If we're secondary, we
+    // emit `tabConflict` and arm a background wait so we can promote if
+    // the primary tab disconnects.
+    const role = await this.acquireLockOrWait();
+    this.isPrimaryFlag = role === "primary";
+    if (this.isPrimaryFlag) {
+      await this.activatePrimary();
+    } else {
+      this.dispatch("tabConflict", { role: "secondary", activeAt: Date.now() });
+      if (this.lockName) this.armBackgroundLockWait(this.lockName);
     }
+  }
+
+  /**
+   * Primary-side activation. Uploads the device's bundle (if not already
+   * present), connects the WS, and lets `onWsState("open")` drive the
+   * drainPending / topup / refresh-self-bundles flow. Idempotent — safe to
+   * call from both initial bootstrap and from a takeOver-promotion path.
+   */
+  private async activatePrimary(): Promise<void> {
+    await this.keyBundle.ensureKeyBundle();
+    // After a previous demote we may have closed the WS — re-open it.
+    // WsClient.connect is safe to call on an already-open WS (no-op).
+    await this.ws.connect();
+    // drainPending + topUpIfNeeded + refreshSelfBundles run via the
+    // onWsState("open") hook — no need to repeat them here.
+  }
+
+  // ── multi-tab coordination internals ──────────────────────────────────────
+
+  /**
+   * Resolve to `"primary"` if this tab grabs the cross-tab lock immediately,
+   * or `"secondary"` if another tab already holds it. The lock is held in
+   * the background until `releaseHeldLock()` is called (from `disconnect`)
+   * or until another tab steals it via `takeOver`.
+   *
+   * No-op fallback: returns `"primary"` on environments without
+   * `navigator.locks` (Node tests, very old browsers).
+   */
+  private acquireLockOrWait(): Promise<"primary" | "secondary"> {
+    if (!hasWebLocks() || !this.lockName) {
+      return Promise.resolve("primary");
+    }
+    const name = this.lockName;
+    return new Promise((settle) => {
+      let settled = false;
+      const lockHold = new Promise<void>((release) => {
+        this.releaseHeldLock = release;
+      });
+      const req = navigator.locks.request(
+        name,
+        { mode: "exclusive", ifAvailable: true },
+        async (lock) => {
+          if (lock === null) {
+            // Someone else is holding it — we're secondary.
+            if (!settled) {
+              settled = true;
+              settle("secondary");
+            }
+            return;
+          }
+          if (!settled) {
+            settled = true;
+            settle("primary");
+          }
+          await lockHold;
+        },
+      );
+      req.catch(() => {
+        // Lock was stolen after acquisition (another tab called takeOver).
+        if (this.isPrimaryFlag) void this.demoteFromPrimary();
+      });
+    });
+  }
+
+  /**
+   * Queue an exclusive lock request without `ifAvailable` — it waits until
+   * the lock is freeable, then we promote. Used while in secondary state
+   * so we can auto-recover when the primary tab disconnects.
+   */
+  private armBackgroundLockWait(name: string): void {
+    if (!hasWebLocks()) return;
+    const lockHold = new Promise<void>((release) => {
+      this.releaseHeldLock = release;
+    });
+    navigator.locks
+      .request(name, { mode: "exclusive" }, async () => {
+        if (!this.isPrimaryFlag) {
+          this.isPrimaryFlag = true;
+          try {
+            await this.activatePrimary();
+            this.dispatch("tabConflict", { role: "primary", activeAt: Date.now() });
+          } catch {
+            // Activation failed; demote back so we stay consistent.
+            this.isPrimaryFlag = false;
+          }
+        }
+        await lockHold;
+      })
+      .catch(() => {
+        if (this.isPrimaryFlag) void this.demoteFromPrimary();
+      });
+  }
+
+  /**
+   * Steal the lock + activate. Used by `takeOver` to forcibly become
+   * primary. Awaits the WS being open so callers know the SDK is ready
+   * when this returns.
+   */
+  private stealAndActivate(name: string): Promise<void> {
+    if (!hasWebLocks()) return Promise.resolve();
+    return new Promise<void>((resolveActive, rejectActive) => {
+      const lockHold = new Promise<void>((release) => {
+        this.releaseHeldLock = release;
+      });
+      navigator.locks
+        .request(name, { mode: "exclusive", steal: true }, async () => {
+          try {
+            this.isPrimaryFlag = true;
+            await this.activatePrimary();
+            this.dispatch("tabConflict", { role: "primary", activeAt: Date.now() });
+            resolveActive();
+          } catch (err) {
+            this.isPrimaryFlag = false;
+            rejectActive(err as Error);
+          }
+          await lockHold;
+        })
+        .catch(() => {
+          if (this.isPrimaryFlag) void this.demoteFromPrimary();
+        });
+    });
+  }
+
+  /**
+   * Demote from primary: close the WS, emit the role-change event, and
+   * re-arm a background wait so we can be promoted again later. Called
+   * when another tab steals our lock.
+   */
+  private async demoteFromPrimary(): Promise<void> {
+    if (!this.isPrimaryFlag) return;
+    this.isPrimaryFlag = false;
+    try {
+      await this.ws.close();
+    } catch {
+      // ignore — best-effort cleanup
+    }
+    this.dispatch("tabConflict", { role: "secondary", activeAt: Date.now() });
+    if (this.lockName) this.armBackgroundLockWait(this.lockName);
   }
 
   /**

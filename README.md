@@ -4,7 +4,12 @@ TypeScript SDK for end-to-end encrypted 1:1 chat over the dTelecom mesh. Olm via
 
 ## Status
 
-v0.5.0 — feature complete.
+v0.6.0 — feature complete.
+
+> **v0.6.0 changes vs v0.5.0:**
+> - **Multi-tab coordination** via the Web Locks API. Two tabs of the same `(origin, user)` no longer kick each other into an infinite reconnect loop — only one tab holds the chat WebSocket at a time. The first tab to call `connect()` is **primary**; subsequent tabs become **secondary** and emit a `tabConflict` event with `{ role: "secondary" }`. Secondary tabs can still read history + conversations locally, but outbound sends won't reach the wire. Promote a secondary tab to primary via `chat.takeOver()` — the previous primary gets `tabConflict { role: "secondary" }` and its WS closes gracefully.
+> - **New API:** `chat.isPrimary(): boolean` (sync getter), `chat.takeOver(): Promise<void>`, `chat.on("tabConflict", e => …)` with `e.role: "primary" | "secondary"`.
+> - On browsers without the Web Locks API (deeply old) and in non-browser runtimes (Node tests), the SDK behaves as if always primary — no `tabConflict` events, `takeOver` is a no-op resolution. No app changes needed for single-tab cases.
 
 > **v0.5.0 changes vs v0.4.0:**
 > - **Persisted message status.** `StoredMessage.status` is now mirrored from the in-memory `StatusTracker` on every `statusChange`, so last-known delivery state ("sent" / "delivered" / "read") survives reload. After reload, `getHistory()` returns the message with its last status; further updates still fire `statusChange` if more events arrive.
@@ -90,6 +95,7 @@ chat.on("readReceipt", (e) => /* upTo a given message id */);
 chat.on("peerNewDevice", (e) => /* TOFU UI */);
 chat.on("conversationsChanged", () => /* re-render the chat list */);
 chat.on("connectionStateChange", (e) => /* "connecting" | "open" | "reconnecting" | "closed" */);
+chat.on("tabConflict", (e) => /* "primary" | "secondary" — show "open elsewhere" overlay when secondary */);
 
 await chat.sendText("bob-user-id", "hi bob");
 await chat.editMessage("bob-user-id", messageId, "edited");
