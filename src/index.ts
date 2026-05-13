@@ -196,18 +196,86 @@ export interface TabConflictEvt {
 }
 
 /**
- * Typed error thrown by methods that have explicit, recoverable failure
- * modes the host app should distinguish from generic exceptions. Right now
- * the only code is `"peer_unreachable"` (see `sendText`).
+ * Discriminated codes for `ChatError`. Always check `err.code` before
+ * branching on user-facing copy.
+ *
+ * - `peer_unreachable` — `claim_all` returned no devices (peer has no
+ *   chat-registered device, OR peer has blocked the caller server-side —
+ *   the two cases are indistinguishable by design).
+ * - `auth_expired` — backend returned 401/403. Prompt the user to re-login.
+ *   `err.status` carries the actual code.
+ * - `offline` — the underlying `fetch` threw (no network reachable).
+ * - `rate_limited` — backend returned 429. `err.status === 429`.
+ * - `server_error` — backend returned 5xx. `err.status` carries the code.
+ * - `internal` — SDK-side bug, crypto failure, malformed state, etc.
+ *   Usually means a code path needs investigation; safe to surface as a
+ *   generic "Something went wrong" toast.
+ */
+export type ChatErrorCode =
+  | "peer_unreachable"
+  | "auth_expired"
+  | "offline"
+  | "rate_limited"
+  | "server_error"
+  | "internal";
+
+/**
+ * Typed error thrown by every public SDK method that touches the wire
+ * (`sendText`, `editMessage`, `deleteMessage`, `markRead`, `retrySend`,
+ * `getKnownPeerDevices`, etc.). Wraps lower-level HTTP / fetch / crypto
+ * errors so the FE has a single type to switch on.
  */
 export class ChatError extends Error {
+  /** HTTP status code, when the error originated from an HTTP response. */
+  status?: number;
+  /** Original error for debugging — never displayed to the user. */
+  cause?: Error;
   constructor(
-    public code: "peer_unreachable",
+    public code: ChatErrorCode,
     message: string,
+    opts?: { status?: number; cause?: Error },
   ) {
     super(message);
     this.name = "ChatError";
+    if (opts?.status !== undefined) this.status = opts.status;
+    if (opts?.cause) this.cause = opts.cause;
   }
+}
+
+/**
+ * Map any thrown value into a `ChatError`. Used at the public-API boundary
+ * so callers only ever see `ChatError`, never raw `HttpError` / `TypeError`
+ * from `fetch` / Olm exceptions.
+ */
+function toChatError(err: unknown): ChatError {
+  if (err instanceof ChatError) return err;
+  // HttpError from transport/http.ts — detect by shape, since we don't
+  // re-export the class.
+  if (
+    err instanceof Error &&
+    err.name === "HttpError" &&
+    typeof (err as { status?: unknown }).status === "number"
+  ) {
+    const status = (err as unknown as { status: number }).status;
+    let code: ChatErrorCode;
+    if (status === 401 || status === 403) code = "auth_expired";
+    else if (status === 429) code = "rate_limited";
+    else if (status >= 500) code = "server_error";
+    else code = "internal";
+    return new ChatError(code, err.message, { status, cause: err });
+  }
+  // fetch() rejects with TypeError when the network is unreachable.
+  // Browsers + node-fetch behave the same way here.
+  if (
+    err instanceof TypeError &&
+    /fetch|network|failed|abort/i.test(err.message)
+  ) {
+    return new ChatError("offline", err.message, { cause: err });
+  }
+  if (err instanceof Error) {
+    return new ChatError("internal", err.message, { cause: err });
+  }
+  return new ChatError("internal", String(err));
 }
 
 /**
@@ -413,6 +481,69 @@ export class DTelecomSecureChat {
     await this.selfEcho(peerUserId, event);
     this.typingMgr.clearOnSend(peerUserId);
     return event.id;
+  }
+
+  /**
+   * Re-send a message that previously failed (received `messageSendFailed`
+   * and is in `status: "failed"` locally). Reuses the original `messageId`
+   * so the peer sees one message, not two. Status transitions back to
+   * `"pending"` and ladders up normally as the outbox attempts delivery.
+   *
+   * Throws `ChatError("internal", …)` if:
+   *  - no message is stored under `messageId`
+   *  - the message isn't authored by the local user
+   *  - the message isn't currently in `status: "failed"`
+   *  - the message is tombstoned (`deletedAt !== null`)
+   *
+   * Same `ChatError` codes apply as `sendText` for the wire-side failure
+   * modes (`peer_unreachable`, `auth_expired`, `offline`, etc.).
+   */
+  async retrySend(messageId: string): Promise<void> {
+    if (!this.selfUserId) {
+      throw new ChatError("internal", "SDK not connected yet");
+    }
+    const msg = await this.messages.get(messageId);
+    if (!msg) {
+      throw new ChatError("internal", `message ${messageId} not found`);
+    }
+    if (msg.senderUserId !== this.selfUserId) {
+      throw new ChatError("internal", `cannot retry someone else's message ${messageId}`);
+    }
+    if (msg.deletedAt !== null) {
+      throw new ChatError("internal", `message ${messageId} is deleted; nothing to retry`);
+    }
+    if (msg.status !== "failed") {
+      throw new ChatError(
+        "internal",
+        `message ${messageId} has status ${msg.status ?? "unset"}, expected "failed"`,
+      );
+    }
+
+    // Reconstruct a text event with the SAME id and clientSentAt so the
+    // peer's MessageStore upsert-by-id keeps this thread coherent if any
+    // copy of the message already reached them.
+    const event: ReturnType<typeof newText> = {
+      v: 1,
+      id: msg.id,
+      type: "text",
+      clientSentAt: msg.sentAt,
+      text: msg.text,
+      ...(msg.replyTo !== undefined ? { replyTo: msg.replyTo } : {}),
+    };
+
+    // Reset local status to "pending" BEFORE re-sending so the UI flips
+    // out of the "failed" indicator immediately. If sendContent throws
+    // synchronously (peer_unreachable etc.), the row stays in pending —
+    // FE catches the throw and can decide to revert to failed.
+    await this.messages.put({ ...msg, status: "pending" });
+    this.dispatch("statusChange", {
+      peerUserId: msg.peerUserId,
+      messageId: msg.id,
+      status: "pending",
+    });
+
+    await this.sendContent(msg.peerUserId, event, { ephemeral: false });
+    await this.selfEcho(msg.peerUserId, event);
   }
 
   async editMessage(peerUserId: string, targetId: string, newText: string): Promise<string> {
@@ -1326,6 +1457,22 @@ export class DTelecomSecureChat {
   }
 
   private async sendContent(
+    peerUserId: string,
+    event: ContentEvent,
+    opts: { ephemeral: boolean },
+  ): Promise<void> {
+    try {
+      await this.sendContentInner(peerUserId, event, opts);
+    } catch (err) {
+      // Translate any low-level throw (HttpError, fetch TypeError, crypto
+      // Error) into a typed ChatError so public API callers only need to
+      // switch on `ChatError.code`. Ephemerals (typing) silently swallow
+      // upstream via .catch(() => {}), so the wrap is harmless there.
+      throw toChatError(err);
+    }
+  }
+
+  private async sendContentInner(
     peerUserId: string,
     event: ContentEvent,
     opts: { ephemeral: boolean },

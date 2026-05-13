@@ -380,6 +380,84 @@ describe("DTelecomSecureChat — 0.5.0 surfaces", () => {
     expect(err.code).toBe("peer_unreachable");
   });
 
+  it("retrySend throws ChatError('internal') for unknown messageId", async () => {
+    const sdk = await connectAlice(new MemoryKVStore());
+    let caught: unknown;
+    try {
+      await sdk.retrySend("does-not-exist");
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(ChatError);
+    expect((caught as ChatError).code).toBe("internal");
+    expect((caught as ChatError).message).toMatch(/not found/);
+    await sdk.disconnect();
+  });
+
+  it("retrySend throws on non-failed messages", async () => {
+    const kv = new MemoryKVStore();
+    const sdk = await connectAlice(kv);
+    const store = new MessageStore(kv);
+    await store.put({
+      id: "m1", peerUserId: "bob", senderUserId: "alice",
+      text: "hi", sentAt: 1, editedAt: null, deletedAt: null,
+      status: "sent",
+    });
+    let caught: ChatError | null = null;
+    try {
+      await sdk.retrySend("m1");
+    } catch (err) {
+      caught = err as ChatError;
+    }
+    expect(caught).toBeInstanceOf(ChatError);
+    expect(caught!.code).toBe("internal");
+    expect(caught!.message).toMatch(/status.*expected.*failed/);
+    await sdk.disconnect();
+  });
+
+  it("retrySend on a failed message: resets status to pending + fires statusChange", async () => {
+    const kv = new MemoryKVStore();
+    const sdk = await connectAlice(kv);
+    const store = new MessageStore(kv);
+    await store.put({
+      id: "f1", peerUserId: "bob", senderUserId: "alice",
+      text: "retry me", sentAt: 1, editedAt: null, deletedAt: null,
+      status: "failed",
+    });
+
+    const transitions: string[] = [];
+    sdk.on("statusChange", (e) => {
+      if (e.messageId === "f1") transitions.push(e.status);
+    });
+
+    // sendContent will throw ChatError("peer_unreachable") because there's
+    // no peer registered in the mock; we catch and verify the row is
+    // still "pending" (the optimistic flip happens before sendContent).
+    try {
+      await sdk.retrySend("f1");
+    } catch (err) {
+      expect(err).toBeInstanceOf(ChatError);
+      expect((err as ChatError).code).toBe("peer_unreachable");
+    }
+
+    expect(transitions).toContain("pending");
+    // Read straight from KV — the test's MessageStore has a stale cache
+    // of the original "failed" row we seeded; the SDK's MessageStore
+    // wrote the "pending" update, which lands in KV but not our cache.
+    const raw = await kv.getString("messages/f1");
+    expect(raw).not.toBeNull();
+    expect(JSON.parse(raw!).status).toBe("pending");
+    await sdk.disconnect();
+  });
+
+  it("ChatError supports status + cause fields", () => {
+    const cause = new Error("underlying");
+    const err = new ChatError("auth_expired", "session expired", { status: 401, cause });
+    expect(err.code).toBe("auth_expired");
+    expect(err.status).toBe(401);
+    expect(err.cause).toBe(cause);
+  });
+
   it("isPrimary() defaults to true with no Web Locks API (Node env)", async () => {
     const sdk = await connectAlice(new MemoryKVStore());
     // The test runner doesn't have navigator.locks; SDK falls back to

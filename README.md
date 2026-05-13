@@ -4,7 +4,12 @@ TypeScript SDK for end-to-end encrypted 1:1 chat over the dTelecom mesh. Olm via
 
 ## Status
 
-v0.6.0 — feature complete.
+v0.7.0 — feature complete.
+
+> **v0.7.0 changes vs v0.6.0:**
+> - **`chat.retrySend(messageId)`** — re-sends a previously-failed message reusing the same `messageId`. The peer dedupes by id, so they see one message instead of a duplicate. Local `status` resets to `"pending"`, then ladders up normally. Throws `ChatError("internal", …)` if the message doesn't exist, isn't yours, is deleted, or isn't in `"failed"` state.
+> - **`ChatError` taxonomy expanded.** New codes: `auth_expired` (backend 401/403), `offline` (fetch threw — no network), `rate_limited` (backend 429), `server_error` (backend 5xx), `internal` (SDK-side / crypto / programming errors). `peer_unreachable` unchanged. `ChatError` gains optional `status?: number` and `cause?: Error` fields.
+> - **Every public method that touches the wire** now throws ONLY `ChatError` — `HttpError` from the transport layer is wrapped at the public-API boundary. FE branches on `err.code` with a single `instanceof ChatError` check; no need to handle multiple error classes.
 
 > **v0.6.0 changes vs v0.5.0:**
 > - **Multi-tab coordination** via the Web Locks API. Two tabs of the same `(origin, user)` no longer kick each other into an infinite reconnect loop — only one tab holds the chat WebSocket at a time. The first tab to call `connect()` is **primary**; subsequent tabs become **secondary** and emit a `tabConflict` event with `{ role: "secondary" }`. Secondary tabs can still read history + conversations locally, but outbound sends won't reach the wire. Promote a secondary tab to primary via `chat.takeOver()` — the previous primary gets `tabConflict { role: "secondary" }` and its WS closes gracefully.
