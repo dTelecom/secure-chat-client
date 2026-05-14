@@ -17,7 +17,7 @@ import {
 } from "./content/protocol.js";
 import type { CryptoAdapter } from "./crypto/interface.js";
 import { OlmCryptoAdapter } from "./crypto/olm-adapter.js";
-import { loadOrCreateDeviceId } from "./device.js";
+import { generateUUID, loadOrCreateDeviceId } from "./device.js";
 import { PeerDeviceCache } from "./device_discovery.js";
 import { KeyBundleManager } from "./key_bundle.js";
 import { MessageStore, type StoredMessage } from "./message_store.js";
@@ -325,6 +325,53 @@ export interface KnownPeerDevice {
 
 function verifiedKey(peerUserId: string, peerDeviceId: string): string {
   return `verifiedDevice/${peerUserId}/${peerDeviceId}`;
+}
+
+/**
+ * Bootstrap-time check for the JS-engine globals the SDK reaches for. Fails
+ * fast with an actionable error message if a required polyfill is missing,
+ * rather than letting the missing global manifest as an opaque TypeError
+ * mid-flow (the typical "Cannot read property 'getRandomValues' of
+ * undefined" footgun on un-polyfilled React Native).
+ *
+ * Items checked are the minimum set the SDK can't gracefully degrade past.
+ * APIs we already gate (`navigator.locks`, `indexedDB` via host-supplied
+ * store) aren't checked here.
+ */
+function assertRuntimeReady(): void {
+  // `crypto.getRandomValues` is required everywhere — it backs UUID
+  // generation (via `crypto.randomUUID` natively OR via the explicit
+  // v4 fallback in `device.ts`). RN hosts must install
+  // `react-native-get-random-values` and import it once at app entry.
+  const cryptoRef = (globalThis as { crypto?: { getRandomValues?: unknown } }).crypto;
+  if (typeof cryptoRef?.getRandomValues !== "function") {
+    throw new ChatError(
+      "internal",
+      "crypto.getRandomValues is not available. On React Native, install " +
+        "`react-native-get-random-values` and `import \"react-native-get-random-values\"` " +
+        "once at the top of your app entry file (index.js) before importing this SDK.",
+    );
+  }
+  // `WebSocket` is provided natively by browsers and React Native. Node
+  // tests can pass a fake via the transport layer.
+  const wsRef = (globalThis as { WebSocket?: unknown }).WebSocket;
+  if (typeof wsRef !== "function") {
+    throw new ChatError(
+      "internal",
+      "WebSocket is not available in this runtime. Browser + React Native " +
+        "ship it natively; Node tests should pass a `webSocketImpl` shim.",
+    );
+  }
+  // `fetch` is required for the HTTP transport. Same story — native in
+  // browsers + RN; Node 18+ has it globally; tests can pass `fetchImpl`.
+  const fetchRef = (globalThis as { fetch?: unknown }).fetch;
+  if (typeof fetchRef !== "function") {
+    throw new ChatError(
+      "internal",
+      "globalThis.fetch is not available. Browser + React Native + Node 18+ " +
+        "ship it natively; tests can pass a `fetchImpl` option to `connect()`.",
+    );
+  }
 }
 
 /**
@@ -784,6 +831,7 @@ export class DTelecomSecureChat {
   // ── internals ──────────────────────────────────────────────────────────────
 
   private async bootstrap(opts: ConnectOptions): Promise<void> {
+    assertRuntimeReady();
     this.store = opts.store ?? new WebKVStore();
     this.crypto = opts.crypto ?? new OlmCryptoAdapter({ store: this.store });
     await this.crypto.init();
@@ -1512,7 +1560,7 @@ export class DTelecomSecureChat {
     const targets: ChatSendTarget[] = encrypted.map((e) => ({
       deviceId: e.peerDeviceId,
       ciphertext: e.ciphertext,
-      envelopeUuid: globalThis.crypto.randomUUID(),
+      envelopeUuid: generateUUID(),
     }));
 
     // For non-typing/non-read events, register with the status tracker
@@ -1643,6 +1691,7 @@ export { OlmCryptoAdapter } from "./crypto/olm-adapter.js";
 export { FakeCryptoAdapter } from "./crypto/fake-adapter.js";
 export { MemoryKVStore } from "./store/memory-adapter.js";
 export { WebKVStore } from "./store/web-adapter.js";
+export { MMKVKVStore, type MMKVLike } from "./store/mmkv-adapter.js";
 export type { KVStore } from "./store/interface.js";
 export type { StoredMessage };
 export type { MessageStatus } from "./status.js";

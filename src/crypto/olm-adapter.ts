@@ -16,8 +16,12 @@
 // Outbound session creation uses identityKeyCurve + oneTimeKey (or
 // fallbackPrekey when the OTK is null).
 
-import * as vodozemac from "@dtelecom/vodozemac-wasm";
-import { Account, Session, type InboundResult } from "@dtelecom/vodozemac-wasm";
+// `#vodozemac` is a package.json subpath import that resolves to
+// `@dtelecom/vodozemac-wasm` on web/node, and to `@dtelecom/vodozemac-rn`
+// (UniFFI native bridge) on React Native. The two packages expose an
+// identical class shape, so this file stays target-agnostic.
+import * as vodozemac from "#vodozemac";
+import { Account, Session, type InboundResult } from "#vodozemac";
 import type { ClaimedDevice } from "../types.js";
 import type { KVStore } from "../store/interface.js";
 import type { CryptoAdapter, OutboundEnvelope, UploadBundle } from "./interface.js";

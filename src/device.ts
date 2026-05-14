@@ -6,7 +6,11 @@ import type { KVStore } from "./store/interface.js";
 
 const DEVICE_ID_KEY = "deviceId";
 
-function generateUUID(): string {
+/** Generate a UUID v4. Uses `crypto.randomUUID` when available
+ *  (browsers, Node 18+, Hermes V1), falls back to `crypto.getRandomValues`
+ *  otherwise. Exported so internal call sites don't reach for
+ *  `globalThis.crypto.randomUUID` directly. */
+export function generateUUID(): string {
   // Web Crypto + modern Node both expose crypto.randomUUID().
   if (typeof globalThis.crypto?.randomUUID === "function") {
     return globalThis.crypto.randomUUID();

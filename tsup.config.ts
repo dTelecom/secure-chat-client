@@ -23,7 +23,16 @@ export default defineConfig({
   clean: true,
   treeshake: true,
   splitting: false,
-  external: ["@dtelecom/vodozemac-wasm"],
+  external: [
+    "@dtelecom/vodozemac-wasm",
+    "@dtelecom/vodozemac-rn",
+    // Keep the subpath-import alias in the bundle output as-is, so the
+    // consumer's bundler (Vite/webpack/Metro) resolves it against
+    // package.json's `imports` block at THEIR build time. If esbuild
+    // resolved this here, the conditional would collapse to one target
+    // (whichever esbuild's condition set matches).
+    "#vodozemac",
+  ],
   target: "es2022",
   // Keep a clean public API — don't bundle our own internal modules
   // into multiple chunks; one consumer-friendly entry.

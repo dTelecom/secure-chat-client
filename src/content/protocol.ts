@@ -7,6 +7,8 @@
 // understands is silently dropped (logged at debug). Adding new event
 // types is a non-breaking change as long as receivers tolerate them.
 
+import { generateUUID } from "../device.js";
+
 export const CONTENT_PROTOCOL_VERSION = 1;
 
 /** Common header on every content event. */
@@ -225,7 +227,10 @@ export function decodeEventBytes(bytes: Uint8Array): ContentEvent | null {
 // ── factory helpers (for the SDK send paths) ────────────────────────────────
 
 function newId(): string {
-  return globalThis.crypto.randomUUID();
+  // Use the SDK's UUID helper so we get the same defensive fallback path
+  // (raw getRandomValues → manual v4 layout) when running on engines that
+  // don't yet ship crypto.randomUUID natively.
+  return generateUUID();
 }
 
 export function newText(text: string, replyTo?: string): TextEvent {

@@ -1,6 +1,6 @@
 {
   "name": "@dtelecom/secure-chat-client",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "description": "TypeScript SDK for dTelecom secure 1:1 chat (E2E via Olm/vodozemac, fanout multi-device).",
   "type": "module",
   "main": "dist/index.cjs",
@@ -16,6 +16,12 @@
         "types": "./dist/index.d.cts",
         "default": "./dist/index.cjs"
       }
+    }
+  },
+  "imports": {
+    "#vodozemac": {
+      "react-native": "@dtelecom/vodozemac-rn",
+      "default": "@dtelecom/vodozemac-wasm"
     }
   },
   "files": [
@@ -65,10 +71,18 @@
   },
   "homepage": "https://github.com/dTelecom/secure-chat-client#readme",
   "dependencies": {
-    "@dtelecom/vodozemac-wasm": "^0.1.0",
+    "@dtelecom/vodozemac-wasm": "^0.3.0",
     "@noble/ed25519": "^2.1.0",
     "@noble/hashes": "^1.5.0",
     "bs58": "^6.0.0"
+  },
+  "peerDependencies": {
+    "@dtelecom/vodozemac-rn": "^0.1.0"
+  },
+  "peerDependenciesMeta": {
+    "@dtelecom/vodozemac-rn": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
