@@ -157,4 +157,44 @@ describe("ConversationIndex", () => {
     await h.idx.markReadUpTo("bob", 100);
     expect(await h.idx.totalUnread()).toBe(2);
   });
+
+  it("exposes lastMessage.status (sender-side delivery state)", async () => {
+    // Self-authored message with status = "delivered" — list should expose it.
+    await storeMsg(h.msgs, {
+      id: "m1",
+      peerUserId: "bob",
+      senderUserId: SELF,
+      sentAt: 100,
+      text: "hello bob",
+      status: "delivered",
+    });
+    await h.idx.onMessageStored({
+      peerUserId: "bob",
+      senderUserId: SELF,
+      messageId: "m1",
+      sentAt: 100,
+    });
+
+    const out = await h.idx.list();
+    expect(out[0].lastMessage?.status).toBe("delivered");
+
+    // Peer-authored messages have no status (undefined is the contract).
+    await storeMsg(h.msgs, {
+      id: "m2",
+      peerUserId: "carol",
+      senderUserId: "carol",
+      sentAt: 200,
+      text: "yo",
+    });
+    await h.idx.onMessageStored({
+      peerUserId: "carol",
+      senderUserId: "carol",
+      messageId: "m2",
+      sentAt: 200,
+    });
+
+    const out2 = await h.idx.list();
+    const carol = out2.find((c) => c.peerUserId === "carol");
+    expect(carol?.lastMessage?.status).toBeUndefined();
+  });
 });

@@ -20,6 +20,7 @@
 
 import type { KVStore } from "./store/interface.js";
 import type { MessageStore } from "./message_store.js";
+import type { MessageStatus } from "./status.js";
 
 const KEY_PREFIX = "convindex/";
 
@@ -47,6 +48,10 @@ export interface Conversation {
     text: string;
     editedAt: number | null;
     deletedAt: number | null;
+    /** Sender-side delivery status for self-authored messages — drives
+     *  list-row indicators like "✓✓" / "read". `undefined` on peer-
+     *  authored messages (status only exists for messages we sent). */
+    status?: MessageStatus;
   } | null;
   /** Count of peer-authored, undeleted messages with sentAt > lastReadFromPeerAt. */
   unreadCount: number;
@@ -216,6 +221,7 @@ export class ConversationIndex {
               text: last.text,
               editedAt: last.editedAt,
               deletedAt: last.deletedAt,
+              status: last.status,
             }
           : null,
         unreadCount,
