@@ -91,6 +91,7 @@ async function connectAlice(store: MemoryKVStore = new MemoryKVStore()): Promise
   const suffix = Math.random().toString(36).slice(2, 8);
   return DTelecomSecureChat.connect({
     apiBaseURL: `http://test-${suffix}`,
+    selfUserId: "alice",
     fetchChatToken: async () => mintAlice(),
     fetchHttpBearer: async () => "fake.bearer",
     store,
@@ -107,6 +108,7 @@ describe("tab-coordination in a real browser", () => {
     const baseURL = `http://test-${suffix}`;
     const connectOpts = (store: MemoryKVStore) => ({
       apiBaseURL: baseURL,
+      selfUserId: "alice",
       fetchChatToken: async () => mintAlice(),
       fetchHttpBearer: async () => "fake.bearer",
       store,

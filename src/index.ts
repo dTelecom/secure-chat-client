@@ -28,6 +28,7 @@ import { Outbox } from "./outbox.js";
 import { SessionManager } from "./sessions.js";
 import { StatusTracker, type MessageStatus } from "./status.js";
 import type { KVStore } from "./store/interface.js";
+import { migrateLegacyKeys, ScopedKVStore, wipeScope } from "./store/scoped-adapter.js";
 import { WebKVStore } from "./store/web-adapter.js";
 import { HttpClient, type FetchChatToken, type FetchHttpBearer } from "./transport/http.js";
 export type { FetchChatToken, FetchHttpBearer } from "./transport/http.js";
@@ -43,6 +44,13 @@ export const CONTENT_PROTOCOL_VERSION = _CONTENT_VERSION;
 export interface ConnectOptions {
   /** dmeet-backend (or mock) base URL — e.g. https://dmeet.example.com */
   apiBaseURL: string;
+  /** Authenticated user id (Privy `did:privy:...` in production, opaque
+   *  string in tests). Required — used to namespace ALL persisted SDK
+   *  state under `u/<userId>/...` so multiple users on the same physical
+   *  device / KV instance see disjoint storage. The SDK verifies this
+   *  matches the chat token's `sub` claim on first mint and throws if
+   *  not, defending against caller-side misconfiguration. */
+  selfUserId: string;
   /** Function that mints a chat token + returns the closest dtelecom node WS
    *  URL. The token is used ONLY on the WebSocket handshake (the dtelecom
    *  node can't verify Privy tokens — it needs the Solana-registry-signed
@@ -462,6 +470,22 @@ export class DTelecomSecureChat {
     return chat;
   }
 
+  /**
+   * Delete every persisted SDK key for `userId` from the given store.
+   * Use on sign-out to reclaim space — without this, sign-out leaves
+   * the user's namespace inert but present, and storage grows over
+   * time as users come and go on a shared device. Other users' data on
+   * the same KV instance is untouched.
+   *
+   * Returns the number of keys deleted (zero if `userId` had no data).
+   *
+   * Call `disconnect()` first if the SDK is still connected for that
+   * user — wiping state behind a live SDK instance is undefined.
+   */
+  static async wipeUserData(store: KVStore, userId: string): Promise<number> {
+    return wipeScope(store, userId);
+  }
+
   // The constructor is private-by-convention — use connect().
   private constructor() {}
 
@@ -832,7 +856,33 @@ export class DTelecomSecureChat {
 
   private async bootstrap(opts: ConnectOptions): Promise<void> {
     assertRuntimeReady();
-    this.store = opts.store ?? new WebKVStore();
+
+    if (!opts.selfUserId) {
+      throw new ChatError(
+        "internal",
+        "connect() requires `selfUserId` — pass the authenticated user's id " +
+          "(Privy `did:privy:...` for dmeet). SDK uses it to namespace all " +
+          "persisted state per user.",
+      );
+    }
+    this.selfUserId = opts.selfUserId;
+
+    // Wrap the consumer-provided store with a per-user scope BEFORE any
+    // subsystem touches it. All persisted SDK state (deviceId, Olm pickle,
+    // Olm sessions, message store, conversation index, key-bundle cache,
+    // outbox, status, blocked list, verifiedDevice/*) flows through this
+    // wrapper and lives under `u/<selfUserId>/...`.
+    const rawStore: KVStore = opts.store ?? new WebKVStore();
+    // First-run migration: for installs that pre-date the scoping (anything
+    // built against secure-chat-client@<0.9.0), the legacy single-user data
+    // lives at top-level keys ("deviceId", "olm/account", "convindex/...").
+    // If the scoped namespace is empty AND legacy keys exist, copy them
+    // into this user's namespace. The previous single-user install belonged
+    // to whoever is signing in now (multi-user wasn't supported before this
+    // version), so adopting that data is the safe, non-destructive default.
+    await migrateLegacyKeys(rawStore, this.selfUserId);
+    this.store = new ScopedKVStore(rawStore, this.selfUserId);
+
     this.crypto = opts.crypto ?? new OlmCryptoAdapter({ store: this.store });
     await this.crypto.init();
 
@@ -845,12 +895,20 @@ export class DTelecomSecureChat {
       ...(opts.fetchImpl ? { fetchImpl: opts.fetchImpl } : {}),
     });
 
-    // Seed the token cache and capture our self user id from the claims.
-    // This call is idempotent across tabs (the server doesn't care which
-    // tab minted it), so it's safe to do BEFORE the lock acquisition.
+    // Seed the token cache and verify the chat token's `sub` matches the
+    // declared selfUserId. Mismatch means the consumer's auth state is
+    // out of sync with the SDK's scope, which would otherwise silently
+    // persist user A's data under user B's namespace.
     const mint = await this.http.getMint(this.deviceId);
-    this.selfUserId = parseSubFromJwt(mint.chatToken);
-    this.lockName = `dtelecom-chat:${opts.apiBaseURL}:${this.selfUserId ?? "anon"}`;
+    const sub = parseSubFromJwt(mint.chatToken);
+    if (sub !== this.selfUserId) {
+      throw new ChatError(
+        "internal",
+        `chat token sub (${sub ?? "null"}) does not match selfUserId (${this.selfUserId}). ` +
+          `Caller's auth state is out of sync with the user passed to connect().`,
+      );
+    }
+    this.lockName = `dtelecom-chat:${opts.apiBaseURL}:${this.selfUserId}`;
 
     this.keyBundle = new KeyBundleManager({ http: this.http, crypto: this.crypto, deviceId: this.deviceId });
     // Note: ensureKeyBundle is moved into activatePrimary — secondary tabs

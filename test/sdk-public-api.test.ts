@@ -11,6 +11,13 @@ import { DTelecomSecureChat, ChatError } from "../src/index.js";
 import { FakeCryptoAdapter } from "../src/crypto/fake-adapter.js";
 import { MessageStore } from "../src/message_store.js";
 import { MemoryKVStore } from "../src/store/memory-adapter.js";
+import { ScopedKVStore } from "../src/store/scoped-adapter.js";
+
+// The SDK wraps the consumer-provided KV store with `ScopedKVStore(store,
+// selfUserId)`. Tests that write into the store directly (bypassing the
+// SDK's send path, e.g. to seed history) need the same wrapper so reads
+// the SDK does on its scoped view see the test-seeded rows.
+const scopedAlice = (kv: MemoryKVStore) => new ScopedKVStore(kv, "alice");
 import type { MintTokenResponse } from "../src/types.js";
 
 // ── Fake transport: minimal WS that never fires open ────────────────────────
@@ -94,6 +101,7 @@ async function connectAlice(
 ): Promise<DTelecomSecureChat> {
   return DTelecomSecureChat.connect({
     apiBaseURL: "http://test",
+    selfUserId: "alice",
     fetchChatToken: async () => mintAlice(),
     fetchHttpBearer: async () => "fake.bearer",
     store,
@@ -117,7 +125,7 @@ describe("DTelecomSecureChat — getHistory delegates to MessageStore.listForPee
     // Direct MessageStore exercise — getHistory is a thin pass-through and
     // its own tests live in status-outbox-typing.test.ts.
     const kv = new MemoryKVStore();
-    const store = new MessageStore(kv);
+    const store = new MessageStore(scopedAlice(kv));
     for (let i = 1; i <= 3; i++) {
       await store.put({
         id: `m${i}`,
@@ -215,7 +223,7 @@ describe("DTelecomSecureChat — getHistory survives reconnect on same store", (
     // SDK#1 boots and we drop a message into its store via the underlying
     // MessageStore (the SDK's own write path is exercised by the smoke).
     const sdk1 = await connectAlice(kv);
-    const store1 = new MessageStore(kv);
+    const store1 = new MessageStore(scopedAlice(kv));
     await store1.put({
       id: "m1", peerUserId: "bob", senderUserId: "alice",
       text: "persisted across reconnect", sentAt: 1_000,
@@ -276,6 +284,7 @@ describe("DTelecomSecureChat — local inbound block filter", () => {
 
     const sdk2 = await DTelecomSecureChat.connect({
       apiBaseURL: "http://test",
+      selfUserId: "alice",
       fetchChatToken: async () => mintAlice(),
       fetchHttpBearer: async () => "fake.bearer",
       store: kv,
@@ -303,7 +312,7 @@ describe("DTelecomSecureChat — currentUserId + deleteConversation", () => {
     // smokes and requires a session, which the mocked test stack doesn't
     // set up. The store layer is what deleteConversation has to clean up,
     // so writing through it is the right unit under test.
-    const store = new MessageStore(kv);
+    const store = new MessageStore(scopedAlice(kv));
     await store.put({
       id: "m1", peerUserId: "bob", senderUserId: "bob",
       text: "hi", sentAt: 1_000, editedAt: null, deletedAt: null,
@@ -332,7 +341,7 @@ describe("DTelecomSecureChat — 0.5.0 surfaces", () => {
     const sdk = await connectAlice(kv);
 
     // Seed two peers, two unread + one unread = 3.
-    const store = new MessageStore(kv);
+    const store = new MessageStore(scopedAlice(kv));
     await store.put({ id: "b1", peerUserId: "bob", senderUserId: "bob", text: "x", sentAt: 1, editedAt: null, deletedAt: null });
     await store.put({ id: "b2", peerUserId: "bob", senderUserId: "bob", text: "y", sentAt: 2, editedAt: null, deletedAt: null });
     await store.put({ id: "c1", peerUserId: "carol", senderUserId: "carol", text: "z", sentAt: 3, editedAt: null, deletedAt: null });
@@ -397,7 +406,7 @@ describe("DTelecomSecureChat — 0.5.0 surfaces", () => {
   it("retrySend throws on non-failed messages", async () => {
     const kv = new MemoryKVStore();
     const sdk = await connectAlice(kv);
-    const store = new MessageStore(kv);
+    const store = new MessageStore(scopedAlice(kv));
     await store.put({
       id: "m1", peerUserId: "bob", senderUserId: "alice",
       text: "hi", sentAt: 1, editedAt: null, deletedAt: null,
@@ -418,7 +427,7 @@ describe("DTelecomSecureChat — 0.5.0 surfaces", () => {
   it("retrySend on a failed message: resets status to pending + fires statusChange", async () => {
     const kv = new MemoryKVStore();
     const sdk = await connectAlice(kv);
-    const store = new MessageStore(kv);
+    const store = new MessageStore(scopedAlice(kv));
     await store.put({
       id: "f1", peerUserId: "bob", senderUserId: "alice",
       text: "retry me", sentAt: 1, editedAt: null, deletedAt: null,
@@ -444,7 +453,8 @@ describe("DTelecomSecureChat — 0.5.0 surfaces", () => {
     // Read straight from KV — the test's MessageStore has a stale cache
     // of the original "failed" row we seeded; the SDK's MessageStore
     // wrote the "pending" update, which lands in KV but not our cache.
-    const raw = await kv.getString("messages/f1");
+    // Read through the same scoped wrapper the SDK uses.
+    const raw = await scopedAlice(kv).getString("messages/f1");
     expect(raw).not.toBeNull();
     expect(JSON.parse(raw!).status).toBe("pending");
     await sdk.disconnect();

@@ -145,6 +145,7 @@ export async function sdkConnect(
   const crypto = opts.useFakeCrypto ? new FakeCryptoAdapter() : new OlmCryptoAdapter({ store });
   const sdk = await DTelecomSecureChat.connect({
     apiBaseURL: API_BASE_URL,
+    selfUserId: userId,
     fetchChatToken: mintTokenFor(userId),
     fetchHttpBearer: bearerForMock(userId),
     store,
