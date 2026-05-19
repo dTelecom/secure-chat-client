@@ -110,6 +110,7 @@ export interface AckRequest {
 
 export type FrameKind =
   | "chatSend"
+  | "chatEnvelopeAck"
   | "chatPing"
   | "chatEnvelope"
   | "chatSendResult"
@@ -131,6 +132,27 @@ export interface ChatSendFrame {
 
 export interface ChatPingFrame {
   kind: "chatPing";
+}
+
+/**
+ * Client-device ack for an inbound chatEnvelope. The SDK sends this after it
+ * has durably stored the envelope (post-decrypt, post-`messages.put`). The
+ * node validates the envelopeUuid against its per-WS pending-delivered set
+ * (so a hostile client can't wake unrelated senders' inflight channels) and
+ * then routes the ack to the sender — same-node by signalling the local
+ * inflight channel directly, cross-node by publishing on the sender's
+ * envelope topic.
+ *
+ * Only emitted for envelopes received as `chatEnvelope` frames on the live
+ * WS. Envelopes drained via HTTP `POST /envelopes/pending` are HTTP-acked
+ * via `POST /envelopes/ack` — they were already part of the webhook-stored
+ * path so the sender already saw `StatusStored` and stopped tracking.
+ */
+export interface ChatEnvelopeAckFrame {
+  kind: "chatEnvelopeAck";
+  envelopeUuid: string;
+  senderUserId: string;
+  senderDeviceId: string;
 }
 
 export interface ChatEnvelopeFrame {
@@ -157,5 +179,5 @@ export interface ChatPongFrame {
   kind: "chatPong";
 }
 
-export type OutboundFrame = ChatSendFrame | ChatPingFrame;
+export type OutboundFrame = ChatSendFrame | ChatPingFrame | ChatEnvelopeAckFrame;
 export type InboundFrame = ChatEnvelopeFrame | ChatSendResultFrame | ChatPongFrame;

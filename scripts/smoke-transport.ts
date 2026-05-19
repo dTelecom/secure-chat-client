@@ -157,6 +157,14 @@ async function main() {
   if (recv.ciphertext !== ciphertextB64) {
     throw new Error(`bob received wrong ciphertext (got ${recv.ciphertext})`);
   }
+  // Node v1.1+ requires a chatEnvelopeAck before it returns status=live.
+  // The full SDK does this automatically in handleInboundCiphertext after
+  // messages.put; this raw-transport smoke has to send it manually.
+  bob.ws.sendEnvelopeAck({
+    envelopeUuid,
+    senderUserId: recv.senderUserId,
+    senderDeviceId: recv.senderDeviceId,
+  });
 
   const result = await waitFor(
     () =>

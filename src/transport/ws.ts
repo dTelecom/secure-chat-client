@@ -3,6 +3,7 @@
 // `?access_token=` query param (browsers can't set headers on WS upgrade).
 
 import type {
+  ChatEnvelopeAckFrame,
   ChatPingFrame,
   ChatSendFrame,
   InboundFrame,
@@ -72,6 +73,22 @@ export class WsClient {
   /** Convenience for a chatSend frame. */
   sendChat(frame: Omit<ChatSendFrame, "kind">): void {
     this.send({ kind: "chatSend", ...frame });
+  }
+
+  /**
+   * Convenience for a chatEnvelopeAck frame — fire-and-forget. The SDK
+   * sends this after it has durably stored an inbound envelope (post
+   * `messages.put`). If the WS isn't open the call swallows silently:
+   * the node's sender-side retry / webhook-fallback path is the recovery
+   * mechanism, not WS-level retry from the receiver.
+   */
+  sendEnvelopeAck(frame: Omit<ChatEnvelopeAckFrame, "kind">): void {
+    if (this.state !== "open") return;
+    try {
+      this.send({ kind: "chatEnvelopeAck", ...frame });
+    } catch {
+      // not open mid-call; ignore — sender will timeout + webhook
+    }
   }
 
   /** Convenience for a chatPing. */

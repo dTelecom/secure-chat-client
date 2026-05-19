@@ -24,6 +24,7 @@ import { MessageStore, type StoredMessage } from "./message_store.js";
 import { ConversationIndex } from "./conversations.js";
 export type { Conversation } from "./conversations.js";
 import type { Conversation } from "./conversations.js";
+import { EnvelopeDedup } from "./envelope_dedup.js";
 import { Outbox } from "./outbox.js";
 import { SessionManager } from "./sessions.js";
 import { StatusTracker, type MessageStatus } from "./status.js";
@@ -418,6 +419,7 @@ export class DTelecomSecureChat {
   private messages!: MessageStore;
   private conversations!: ConversationIndex;
   private status!: StatusTracker;
+  private envelopeDedup!: EnvelopeDedup;
   private outbox = new Outbox({
     onTerminalFailure: (entry) => {
       // Outbox gave up. Persist status:"failed" so the UI can render a
@@ -949,6 +951,11 @@ export class DTelecomSecureChat {
       () => this.selfUserId,
     );
     await this.conversations.load();
+    // EnvelopeDedup must hydrate BEFORE drainPending or any inbound frame
+    // processing — see handleInboundCiphertext for why duplicate-decrypt
+    // before dedup is hydrated would corrupt the Olm session.
+    this.envelopeDedup = new EnvelopeDedup(this.store);
+    await this.envelopeDedup.init();
     // Hydrate the block list — KV first (best-effort), then overlay any
     // caller-provided initial value so the explicit option wins.
     await this.loadBlockedUserIds();
@@ -1178,10 +1185,12 @@ export class DTelecomSecureChat {
         for (const env of r.envelopes) {
           try {
             await this.handleInboundCiphertext({
+              envelopeUuid: env.envelopeUuid,
               peerUserId: env.senderUserId,
               peerDeviceId: env.senderDeviceId,
               ciphertext: env.ciphertext,
               msgType: env.msgType,
+              source: "drain",
             });
             ackUuids.push(env.envelopeUuid);
           } catch {
@@ -1199,10 +1208,12 @@ export class DTelecomSecureChat {
   private async onFrame(frame: InboundFrame): Promise<void> {
     if (frame.kind === "chatEnvelope") {
       await this.handleInboundCiphertext({
+        envelopeUuid: frame.envelopeUuid,
         peerUserId: frame.senderUserId,
         peerDeviceId: frame.senderDeviceId,
         ciphertext: frame.ciphertext,
         msgType: frame.msgType,
+        source: "live",
       });
       return;
     }
@@ -1215,12 +1226,53 @@ export class DTelecomSecureChat {
     // chat_pong — ignore; ws.ts already handles ping liveness.
   }
 
+  /**
+   * Process a decrypted-or-to-be-decrypted inbound envelope. Sources:
+   *   - "live": came in via a chatEnvelope WS frame. On success the SDK
+   *     sends back a chatEnvelopeAck so the sender's node promotes the
+   *     status from "queued" to "live."
+   *   - "drain": came in via HTTP /envelopes/pending. The sender already
+   *     saw `StatusStored` (we got here via the webhook path) and acks
+   *     are over HTTP via /envelopes/ack — no WS ack needed.
+   *
+   * Both paths feed the envelopeUuid into the dedup set BEFORE decrypt,
+   * so a duplicate (retry-publish + drain landing on the same envelope)
+   * is dropped pre-ratchet. Olm rejects replays as session corruption,
+   * which would otherwise trigger the heavy forgetPeerDevice recovery
+   * path and nuke the session.
+   */
   private async handleInboundCiphertext(opts: {
+    envelopeUuid: string;
     peerUserId: string;
     peerDeviceId: string;
     ciphertext: string;
     msgType: "prekey" | "normal";
+    source: "live" | "drain";
   }): Promise<void> {
+    // Pre-decrypt dedup. Two delivery paths plus sender-side retries make
+    // duplicates expected — see EnvelopeDedup for the rationale.
+    if (await this.envelopeDedup.has(opts.envelopeUuid)) {
+      // Already processed via the other path or an earlier retry. Re-ack
+      // so the sender's status tracker promotes correctly even if our
+      // first ack got lost in transit (e.g., reconnect dropped the
+      // pending ack send).
+      if (opts.source === "live") {
+        this.ws.sendEnvelopeAck({
+          envelopeUuid: opts.envelopeUuid,
+          senderUserId: opts.peerUserId,
+          senderDeviceId: opts.peerDeviceId,
+        });
+      }
+      return;
+    }
+    // Reserve the uuid BEFORE decrypt so a crash mid-decrypt doesn't
+    // leave the Olm session in a state where the next process-restart
+    // would try to decrypt the same ciphertext again and fail with a
+    // replay error (which the existing recovery path treats as session
+    // corruption). The drain path will re-add on the next run; in the
+    // case of true new envelopes this is just a tiny extra write.
+    await this.envelopeDedup.add(opts.envelopeUuid);
+
     let plaintext: string;
     try {
       plaintext = await this.sessions.decrypt(
@@ -1264,6 +1316,19 @@ export class DTelecomSecureChat {
     const event = decodeEventBytes(new TextEncoder().encode(plaintext));
     if (!event) return; // unknown / malformed: drop silently
     await this.dispatchInboundEvent(opts.peerUserId, opts.peerDeviceId, event);
+
+    // ack-after-store: dispatchInboundEvent has just persisted the event
+    // (text → messages.put, etc.). The chatEnvelopeAck signals the node
+    // to promote the sender's chatSendResult to "live." Only WS-delivered
+    // envelopes get acked over WS; drain-path envelopes already used the
+    // HTTP /envelopes/ack route and the sender already saw "stored."
+    if (opts.source === "live") {
+      this.ws.sendEnvelopeAck({
+        envelopeUuid: opts.envelopeUuid,
+        senderUserId: opts.peerUserId,
+        senderDeviceId: opts.peerDeviceId,
+      });
+    }
   }
 
   /**
