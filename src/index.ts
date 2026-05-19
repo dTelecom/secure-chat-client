@@ -85,6 +85,17 @@ export interface ConnectOptions {
    *  drain doesn't surface blocked messages before the host has refreshed
    *  its view. */
   initialBlockedUserIds?: string[];
+  /** Minimum time (ms) between background-discovery calls for the same
+   *  peer. Each outbound `sendText` for a non-self peer kicks off a
+   *  cheap `/keys/list_devices` to detect newly-registered devices; this
+   *  floor coalesces a chatty burst into a single discovery per window.
+   *  Default 30_000. Set lower (e.g. 0) in tests that want every send
+   *  to be able to discover. */
+  backgroundDiscoveryFloorMs?: number;
+  /** When `false`, disables the per-send background-discovery path
+   *  entirely. The bundleCache is only refreshed on reconnect or via
+   *  explicit `refreshPeerBundles` (caller-driven). Default `true`. */
+  backgroundDiscovery?: boolean;
 }
 
 // ── public event types ──────────────────────────────────────────────────────
@@ -920,6 +931,15 @@ export class DTelecomSecureChat {
       crypto: this.crypto,
       selfDeviceId: this.deviceId,
       selfUserId: this.selfUserId,
+      // Background discovery: every outbound encrypt kicks off a cheap
+      // list_devices in parallel; if a peer has a device the bundleCache
+      // didn't know about, the SAME plaintext is encrypted for it and
+      // shipped via the WS path below.
+      ...(opts.backgroundDiscovery !== undefined && { backgroundDiscovery: opts.backgroundDiscovery }),
+      ...(opts.backgroundDiscoveryFloorMs !== undefined && {
+        backgroundDiscoveryFloorMs: opts.backgroundDiscoveryFloorMs,
+      }),
+      onCatchUpEnvelope: (env) => this.shipCatchUpEnvelope(env),
     });
     this.peerDevices = new PeerDeviceCache({ http: this.http, selfDeviceId: this.deviceId });
     this.messages = new MessageStore(this.store);
@@ -1578,6 +1598,41 @@ export class DTelecomSecureChat {
     }
   }
 
+  /**
+   * Best-effort delivery of a single ciphertext to a peer device that
+   * `SessionManager`'s background discovery just learned about. The
+   * original send already completed (via `sendContentInner`) to the
+   * devices the bundleCache knew about; this catches up the same
+   * plaintext to the newly-discovered device.
+   *
+   * Status tracker is NOT updated — the user-visible "delivered" state
+   * is already driven by the original target set. The catch-up envelope
+   * is silent on the SDK API surface: if it lands, the recipient device
+   * gets the message; if it doesn't, future sends fanout to that device
+   * naturally (bundleCache has been refreshed by the discovery flow).
+   *
+   * Drops if the WS isn't open. No outbox queueing — the catch-up is an
+   * optimization on top of the existing protocol, not a delivery
+   * guarantee. The "real" guarantee is the next normal send.
+   */
+  private shipCatchUpEnvelope(env: import("./sessions.js").CatchUpEnvelope): void {
+    if (this.ws.getState() !== "open") return;
+    const target: ChatSendTarget = {
+      deviceId: env.peerDeviceId,
+      ciphertext: env.ciphertext,
+      envelopeUuid: generateUUID(),
+    };
+    try {
+      this.ws.sendChat({
+        toUserId: env.peerUserId,
+        msgType: env.msgType,
+        targets: [target],
+      });
+    } catch {
+      // best-effort
+    }
+  }
+
   private async sendContentInner(
     peerUserId: string,
     event: ContentEvent,
@@ -1615,11 +1670,25 @@ export class DTelecomSecureChat {
         `peer ${peerUserId} has no chat-registered devices (claim_all returned empty)`,
       );
     }
-    const targets: ChatSendTarget[] = encrypted.map((e) => ({
-      deviceId: e.peerDeviceId,
-      ciphertext: e.ciphertext,
-      envelopeUuid: generateUUID(),
+    // Build {target, msgType} entries so we can group by msgType below.
+    // The wire protocol carries msgType at the frame level (not per-
+    // target), but per-device encryption produces a MIX of msgTypes:
+    // existing-session devices get msgType="normal", first-contact
+    // devices get msgType="prekey" (from a freshly-claimed OTK). If we
+    // sent one frame with a single msgType across all targets, the
+    // recipients whose actual ciphertext doesn't match that msgType
+    // would silently fail to decrypt — the bytes for prekey vs normal
+    // are structurally different. Solution: bucket targets by their
+    // actual msgType and emit one chatSend frame per bucket.
+    const entries = encrypted.map((e) => ({
+      target: {
+        deviceId: e.peerDeviceId,
+        ciphertext: e.ciphertext,
+        envelopeUuid: generateUUID(),
+      } satisfies ChatSendTarget,
+      msgType: e.msgType,
     }));
+    const targets: ChatSendTarget[] = entries.map((e) => e.target);
 
     // For non-typing/non-read events, register with the status tracker
     // so chatSendResult and inbound `received`/`read` can update status.
@@ -1629,23 +1698,34 @@ export class DTelecomSecureChat {
       this.status.trackOutbound({ messageId: event.id, peerUserId, envelopeToDevice: map });
     }
 
-    const msgType = encrypted[0].msgType; // shared across targets in this fanout
-    const frame = {
+    // Group by msgType → one frame per bucket. Typical fanout produces
+    // either ALL normal (steady-state) or 1 prekey + N normal (when a
+    // peer just added a new device); the cost of the second frame is
+    // negligible compared to the silent-decrypt-fail it prevents.
+    const byMsgType = new Map<"prekey" | "normal", ChatSendTarget[]>();
+    for (const e of entries) {
+      const arr = byMsgType.get(e.msgType) ?? [];
+      arr.push(e.target);
+      byMsgType.set(e.msgType, arr);
+    }
+    const frames = Array.from(byMsgType.entries()).map(([msgType, t]) => ({
       toUserId: peerUserId,
       ephemeral: opts.ephemeral || undefined,
       msgType,
-      targets,
-    } as const;
+      targets: t,
+    }));
 
     if (opts.ephemeral) {
       // Typing & other ephemerals are fire-and-forget — if the WS isn't
       // open, drop silently. Retrying typing later would deliver a
       // confusing "X is typing" hours after the fact.
       if (this.ws.getState() === "open") {
-        try {
-          this.ws.sendChat(frame);
-        } catch {
-          // ignore
+        for (const f of frames) {
+          try {
+            this.ws.sendChat(f);
+          } catch {
+            // ignore
+          }
         }
       }
       return;
@@ -1666,7 +1746,9 @@ export class DTelecomSecureChat {
           return outcomes;
         }
         try {
-          this.ws.sendChat(frame);
+          for (const f of frames) {
+            this.ws.sendChat(f);
+          }
           // Synthesize "stored" so the outbox treats this as a successful
           // attempt and removes the entry. The real per-target outcome
           // arrives separately as a chatSendResult frame (consumed by

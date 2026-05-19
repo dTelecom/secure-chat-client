@@ -36,7 +36,7 @@ await runSmoke("smoke:otk-exhaustion", async () => {
   const drainerHttp = new HttpClient({
     apiBaseURL: API_BASE_URL,
     fetchChatToken: mintTokenFor(drainerUser),
-    fetchHttpBearer: bearerForMock(drainerUser),
+    fetchHttpBearer: bearerForMock(drainerUser, "drainer-dev"),
   });
   // Make the drainer registered (mint a token under its user id so
   // /keys/claim_all auth passes).
@@ -50,7 +50,7 @@ await runSmoke("smoke:otk-exhaustion", async () => {
   const bobHttp = new HttpClient({
     apiBaseURL: API_BASE_URL,
     fetchChatToken: mintTokenFor(bobUser),
-    fetchHttpBearer: bearerForMock(bobUser),
+    fetchHttpBearer: bearerForMock(bobUser, bob.deviceId),
   });
   const count = await bobHttp.otkCount(bob.deviceId);
   check("bob's OTK pool is empty after 100 claims", count.count === 0,
@@ -66,7 +66,7 @@ await runSmoke("smoke:otk-exhaustion", async () => {
   const aliceProbe = new HttpClient({
     apiBaseURL: API_BASE_URL,
     fetchChatToken: mintTokenFor(probeUser),
-    fetchHttpBearer: bearerForMock(probeUser),
+    fetchHttpBearer: bearerForMock(probeUser, "alice-probe-dev"),
   });
   await aliceProbe.getMint("alice-probe-dev");
   const claim = await aliceProbe.claimAll("alice-probe-dev", bobUser);

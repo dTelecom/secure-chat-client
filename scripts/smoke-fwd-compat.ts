@@ -29,7 +29,7 @@ await runSmoke("smoke:fwd-compat", async () => {
   // session with vodozemac, encrypt a v=2 plaintext, send chatSend frame.
   const aliceUserId = `alice-fwd-${Date.now()}`;
   const aliceDeviceId = `alice-${uuid().slice(0, 8)}`;
-  const http = new HttpClient({ apiBaseURL: API_BASE_URL, fetchChatToken: mintTokenFor(aliceUserId), fetchHttpBearer: bearerForMock(aliceUserId) });
+  const http = new HttpClient({ apiBaseURL: API_BASE_URL, fetchChatToken: mintTokenFor(aliceUserId), fetchHttpBearer: bearerForMock(aliceUserId, aliceDeviceId) });
   const claim = await http.claimAll(aliceDeviceId, bob.userId);
   if (claim.devices.length === 0) {
     throw new Error("claim_all returned 0 devices for bob");

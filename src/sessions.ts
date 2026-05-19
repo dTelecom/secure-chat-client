@@ -18,6 +18,31 @@ export interface SessionManagerOptions {
   /** This user's id. When sending to self (multi-device echo), used to
    *  filter our own device from the fanout. */
   selfUserId?: string | null;
+  /** When `true` (default), every `encryptForPeer` kicks off a background
+   *  `/keys/list_devices` call to detect peer devices the bundleCache
+   *  doesn't yet know about. On discovery, the same plaintext is
+   *  encrypted for the new device(s) and emitted via
+   *  `onCatchUpEnvelope` — the SDK ships them through the same outbound
+   *  path as the original send. Rate-limited per peer (see
+   *  `backgroundDiscoveryFloorMs`). Set to `false` to disable. */
+  backgroundDiscovery?: boolean;
+  /** Minimum time between background-discovery calls for the same peer.
+   *  Defaults to 30s. A burst of rapid sends to the same peer triggers
+   *  exactly one discovery within this window. */
+  backgroundDiscoveryFloorMs?: number;
+  /** Callback fired ONCE per new-device-catch-up envelope. The SDK wires
+   *  this to its outbound shipper so caught-up ciphertexts travel the
+   *  same chatSend / offline-envelope path as the immediate fanout. */
+  onCatchUpEnvelope?: (env: CatchUpEnvelope) => void;
+}
+
+/** Emitted by background discovery when a peer device the bundleCache
+ *  didn't know about gets caught up with the same plaintext. */
+export interface CatchUpEnvelope {
+  peerUserId: string;
+  peerDeviceId: string;
+  ciphertext: string;
+  msgType: "prekey" | "normal";
 }
 
 /**
@@ -51,6 +76,22 @@ export class SessionManager {
   // inbound side never saw.
   private inflightRefresh = new Map<string, Promise<ClaimedDevice[]>>();
 
+  // Last-discovery timestamp per peer, in ms since epoch. Background
+  // discovery on `encryptForPeer` is gated by `backgroundDiscoveryFloorMs`
+  // (default 30s) so a chatty burst doesn't fire one list_devices per
+  // message.
+  private lastDiscoveryAt = new Map<string, number>();
+
+  // In-flight background-discovery promises keyed by peer user. Coalesces
+  // parallel sends so they share one list_devices call.
+  private inflightDiscovery = new Map<string, Promise<void>>();
+
+  // Plaintexts to catch up for new devices, accumulated while a discovery
+  // is in flight. Drained ONCE (atomically with the bundleCache refresh)
+  // when discovery returns. Subsequent sends after the drain use the
+  // fresh bundleCache for natural fanout and don't need catch-up.
+  private pendingCatchUp = new Map<string, string[]>();
+
   constructor(private opts: SessionManagerOptions) {}
 
   /**
@@ -68,13 +109,24 @@ export class SessionManager {
     if (this.opts.selfUserId && peerUserId === this.opts.selfUserId) {
       devices = devices.filter((d) => d.deviceId !== this.opts.selfDeviceId);
     }
-    if (devices.length === 0) return [];
+    if (devices.length === 0) {
+      // No known devices — still kick off discovery so a future send picks
+      // up bob-B even when bob's first device-set was empty at cold start.
+      this.maybeKickOffDiscovery(peerUserId, plaintext, devices);
+      return [];
+    }
 
     const results: EncryptForResult[] = [];
     for (const dev of devices) {
       const env = await this.encryptForOneDevice(peerUserId, dev, plaintext);
       results.push({ peerDeviceId: dev.deviceId, ciphertext: env.ciphertext, msgType: env.msgType });
     }
+
+    // After the synchronous fanout, kick off background discovery for any
+    // peer devices the bundleCache didn't know about. Fire-and-forget —
+    // the original send is NOT blocked on the discovery network call.
+    this.maybeKickOffDiscovery(peerUserId, plaintext, devices);
+
     return results;
   }
 
@@ -154,6 +206,143 @@ export class SessionManager {
     })();
     this.inflightRefresh.set(peerUserId, p);
     return p;
+  }
+
+  // Upper bound on plaintexts queued for catch-up during a single
+  // discovery window. Bursts beyond this are dropped (best-effort).
+  // 100 is generous — at 30s floor + typical chat rate it's hundreds
+  // of messages worth of headroom.
+  private static readonly DISCOVERY_QUEUE_CAP = 100;
+
+  /**
+   * Schedules a background `/keys/list_devices` for `peerUserId` unless
+   *   (a) backgroundDiscovery is disabled,
+   *   (b) we're sending to ourselves (self-fanout owns its own refresh).
+   * If a discovery is already in flight for this peer, the plaintext is
+   * appended to the catch-up queue and a new discovery is NOT started.
+   * If under the rate-limit floor since the last completed discovery,
+   * no new discovery is started AND nothing is queued (the floor is the
+   * promise that we won't re-check more than once per window — anything
+   * the caller wants delivered in this window must rely on natural
+   * fanout from the current bundleCache).
+   * Always returns synchronously — caller does NOT await.
+   */
+  private maybeKickOffDiscovery(
+    peerUserId: string,
+    plaintext: string,
+    knownDevices: ClaimedDevice[],
+  ): void {
+    if (this.opts.backgroundDiscovery === false) return;
+    if (peerUserId === this.opts.selfUserId) return; // self-fanout owns its own refresh
+
+    // Discovery already running for this peer → queue plaintext for the
+    // in-flight catch-up window. Once that discovery returns, all queued
+    // plaintexts get encrypted for any newly-discovered devices.
+    if (this.inflightDiscovery.has(peerUserId)) {
+      const q = this.pendingCatchUp.get(peerUserId);
+      if (q && q.length < SessionManager.DISCOVERY_QUEUE_CAP) {
+        q.push(plaintext);
+      }
+      return;
+    }
+
+    const floor = this.opts.backgroundDiscoveryFloorMs ?? 30_000;
+    const lastAt = this.lastDiscoveryAt.get(peerUserId) ?? 0;
+    if (Date.now() - lastAt < floor) return;
+
+    // Start a fresh discovery. Seed the queue with this plaintext —
+    // additional concurrent sends append to it via the branch above.
+    this.pendingCatchUp.set(peerUserId, [plaintext]);
+    this.lastDiscoveryAt.set(peerUserId, Date.now());
+
+    const p = (async () => {
+      try {
+        await this.discoverAndCatchUp(peerUserId, knownDevices);
+      } finally {
+        this.inflightDiscovery.delete(peerUserId);
+        this.pendingCatchUp.delete(peerUserId);
+      }
+    })();
+    this.inflightDiscovery.set(peerUserId, p);
+    // Surface unhandled rejection so it doesn't pollute the runtime log;
+    // discovery failures are best-effort.
+    p.catch(() => {});
+  }
+
+  /**
+   * Implementation of background catch-up. Strategy:
+   *   1. list_devices(peer)            — cheap, no OTK consumption.
+   *   2. diff against `knownDevices`   — captured at send time, before
+   *                                       any concurrent refresh.
+   *   3. if there's anything new      — refreshPeerBundles(peer) to pull
+   *      the new device's bundle (and incidentally refresh existing ones).
+   *      claim_all consumes OTKs for ALL listed devices; this cost is
+   *      paid once per genuine device-set change, not per send.
+   *   4. snapshot the catch-up queue THEN clear it. New sends after the
+   *      bundleCache refresh fanout to the new device naturally and
+   *      shouldn't be caught up again — clearing the queue here is what
+   *      prevents double-delivery to the new device.
+   *   5. encrypt each queued plaintext for each new device and emit via
+   *      onCatchUpEnvelope so the SDK can ship them.
+   */
+  private async discoverAndCatchUp(
+    peerUserId: string,
+    knownDevices: ClaimedDevice[],
+  ): Promise<void> {
+    let live;
+    try {
+      live = await this.opts.http.listDevices(this.opts.selfDeviceId, peerUserId);
+    } catch {
+      return; // network blip; next send tries again after the floor
+    }
+
+    const known = new Set(knownDevices.map((d) => d.deviceId));
+    const newDeviceIds = live.devices
+      .filter((d) => !known.has(d.deviceId))
+      .filter((d) =>
+        !(peerUserId === this.opts.selfUserId && d.deviceId === this.opts.selfDeviceId),
+      )
+      .map((d) => d.deviceId);
+
+    if (newDeviceIds.length === 0) return;
+
+    // Refresh bundleCache FIRST so post-refresh sends fanout naturally.
+    let refreshed: ClaimedDevice[];
+    try {
+      refreshed = await this.refreshPeerBundles(peerUserId);
+    } catch {
+      return;
+    }
+
+    // Snapshot + clear the queue. Anything that lands in pendingCatchUp
+    // AFTER this point will be dropped on the `finally` cleanup — but
+    // those sends already saw the fresh bundleCache and fanned out to
+    // the new device naturally, so dropping their queue entries is the
+    // right thing (avoids double-encrypt).
+    const queue = this.pendingCatchUp.get(peerUserId) ?? [];
+    this.pendingCatchUp.set(peerUserId, []);
+
+    const targets = refreshed.filter((d) => newDeviceIds.includes(d.deviceId));
+    const emit = this.opts.onCatchUpEnvelope;
+
+    // Drain in original send order — each encrypt advances the new Olm
+    // session's ratchet, so the recipient decrypts cleanly when it
+    // receives them in this order.
+    for (const pt of queue) {
+      for (const dev of targets) {
+        try {
+          const env = await this.encryptForOneDevice(peerUserId, dev, pt);
+          emit?.({
+            peerUserId,
+            peerDeviceId: dev.deviceId,
+            ciphertext: env.ciphertext,
+            msgType: env.msgType,
+          });
+        } catch {
+          // Per-target best-effort.
+        }
+      }
+    }
   }
 
   private async encryptForOneDevice(

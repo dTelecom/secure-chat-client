@@ -73,18 +73,21 @@ export function mintTokenFor(userId: string) {
 /**
  * fetchHttpBearer for the in-memory mock — re-uses the chat JWT for the
  * Authorization header on HTTP calls. The mock accepts that as a stand-in
- * for the host's session bearer. The deviceId is irrelevant for the mock's
- * auth, so we pass an empty string and just want the JWT.
+ * for the host's session bearer.
+ *
+ * The mock's /keys/* routes enforce `body.deviceId === bearer.did`, so the
+ * bearer MUST be minted with the same deviceId the SDK uses in its request
+ * bodies. Pass the SDK's session deviceId here.
  *
  * Against the real dmeet-backend a Privy access token would go here instead.
  */
-export function bearerForMock(userId: string): () => Promise<string> {
+export function bearerForMock(userId: string, deviceId: string): () => Promise<string> {
   const mint = mintTokenFor(userId);
   let cached: { token: string; exp: number } | null = null;
   return async () => {
     const now = Math.floor(Date.now() / 1000);
     if (cached && cached.exp - now > 60) return cached.token;
-    const r = await mint("smoke-bearer");
+    const r = await mint(deviceId);
     cached = { token: r.chatToken, exp: r.expiresAt };
     return r.chatToken;
   };
@@ -105,7 +108,7 @@ export async function rawConnect(userId: string, deviceId?: string): Promise<Raw
   const http = new HttpClient({
     apiBaseURL: API_BASE_URL,
     fetchChatToken: mintTokenFor(userId),
-    fetchHttpBearer: bearerForMock(userId),
+    fetchHttpBearer: bearerForMock(userId, dev),
   });
   const url = await http.getNodeWsUrl(dev);
   const baseUrl = url.replace(/\/chat\/ws\/?$/, "");
@@ -132,24 +135,51 @@ export interface SdkSide {
 
 export async function sdkConnect(
   userId: string,
-  opts: { deviceId?: string; useFakeCrypto?: boolean; store?: MemoryKVStore } = {},
+  opts: {
+    deviceId?: string;
+    useFakeCrypto?: boolean;
+    store?: MemoryKVStore;
+    /** Override the 30s background-discovery floor. Set to 0 in scenarios
+     *  that need EVERY send to be able to discover a newly-registered
+     *  peer device (e.g., the multi-device smoke runs multiple scenarios
+     *  back-to-back and can't afford to wait out the production floor). */
+    backgroundDiscoveryFloorMs?: number;
+  } = {},
 ): Promise<SdkSide> {
-  // The SDK derives its own deviceId from `store` via loadOrCreateDeviceId
-  // — passing `deviceId` here only makes a difference when the caller
-  // also pre-seeds the store. Returning `sdk.currentDeviceId` ensures
-  // callers can reconnect against the same identity.
   const store = opts.store ?? new MemoryKVStore();
-  if (opts.deviceId !== undefined && opts.store === undefined) {
-    await store.setString("deviceId", opts.deviceId);
+
+  // Resolve the deviceId BEFORE the bearer factory — the mock's auth
+  // enforces `body.deviceId === bearer.did`, so the bearer JWT has to be
+  // minted with the SDK's actual session deviceId.
+  //   - opts.deviceId provided → use that
+  //   - opts.store provided + existing scoped/legacy entry → reuse it
+  //   - otherwise → generate fresh and pre-seed
+  let deviceId = opts.deviceId;
+  if (!deviceId) {
+    deviceId =
+      (await store.getString(`u/${userId}/deviceId`)) ??
+      (await store.getString("deviceId")) ??
+      undefined;
   }
+  if (!deviceId) {
+    deviceId = `dev-${globalThis.crypto.randomUUID().slice(0, 12)}`;
+  }
+  // Pre-seed at the scoped path (0.9.0+ shape). If a legacy "deviceId" key
+  // also exists in the store, the SDK's `migrateLegacyKeys` will reconcile
+  // — but pre-seeding at the scoped key here is the direct path.
+  await store.setString(`u/${userId}/deviceId`, deviceId);
+
   const crypto = opts.useFakeCrypto ? new FakeCryptoAdapter() : new OlmCryptoAdapter({ store });
   const sdk = await DTelecomSecureChat.connect({
     apiBaseURL: API_BASE_URL,
     selfUserId: userId,
     fetchChatToken: mintTokenFor(userId),
-    fetchHttpBearer: bearerForMock(userId),
+    fetchHttpBearer: bearerForMock(userId, deviceId),
     store,
     crypto,
+    ...(opts.backgroundDiscoveryFloorMs !== undefined && {
+      backgroundDiscoveryFloorMs: opts.backgroundDiscoveryFloorMs,
+    }),
   });
   return { sdk, userId, deviceId: sdk.currentDeviceId, store };
 }
