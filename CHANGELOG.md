@@ -13,6 +13,25 @@ control — there is no broad-deployment compat negotiation.
 
 ---
 
+## [0.13.1] — 2026-05-20
+
+### Fixed
+
+- **0.13.0 published with stale `dist/`** — `npm publish` packed an
+  old compiled output from before the logging work landed, so the
+  published tarball was missing `ConnectOptions.debug`,
+  `getDiagnostics()`, and all the instrumentation. 0.13.1 has the
+  correct compiled output. Added a `prepublishOnly` hook that runs
+  `tsup` to prevent this from recurring.
+
+### Source-level changes vs 0.13.0
+
+None — same source as 0.13.0. This is purely a republish with the
+correct compiled `dist/`. If you installed `^0.13.0` you have the
+broken version; upgrade to `^0.13.1` to actually get the logging.
+
+---
+
 ## [0.13.0] — 2026-05-20
 
 ### Added
@@ -401,6 +420,7 @@ Initial release. Core surface:
   `typing`, `statusChange`, `peerNewDevice`
 - Olm + vodozemac WASM crypto, MMKV / web / memory KV adapters.
 
+[0.13.1]: https://github.com/dTelecom/secure-chat-client/releases/tag/v0.13.1
 [0.13.0]: https://github.com/dTelecom/secure-chat-client/releases/tag/v0.13.0
 [0.12.1]: https://github.com/dTelecom/secure-chat-client/releases/tag/v0.12.1
 [0.12.0]: https://github.com/dTelecom/secure-chat-client/releases/tag/v0.12.0
