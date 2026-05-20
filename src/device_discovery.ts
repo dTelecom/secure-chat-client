@@ -86,4 +86,13 @@ export class PeerDeviceCache {
   clear(): void {
     this.cache.clear();
   }
+
+  /** Snapshot for chat.getDiagnostics(). No key material. */
+  diagnostics(): Array<{ peerUserId: string; deviceCount: number; fetchedAt: number }> {
+    return Array.from(this.cache.entries()).map(([peerUserId, entry]) => ({
+      peerUserId,
+      deviceCount: entry.devices.length,
+      fetchedAt: entry.fetchedAt,
+    }));
+  }
 }

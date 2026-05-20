@@ -7,6 +7,7 @@
 // stateless other than its in-memory locking.
 
 import type { CryptoAdapter, OutboundEnvelope } from "./crypto/interface.js";
+import { silentLogger, type Logger } from "./logging.js";
 import type { HttpClient } from "./transport/http.js";
 import type { ClaimedDevice } from "./types.js";
 
@@ -15,6 +16,8 @@ export interface SessionManagerOptions {
   crypto: CryptoAdapter;
   /** This device's id, used to authenticate /keys/claim_all. */
   selfDeviceId: string;
+  /** Optional logger. Defaults to a silent no-op so tests stay quiet. */
+  log?: Logger;
   /** This user's id. When sending to self (multi-device echo), used to
    *  filter our own device from the fanout. */
   selfUserId?: string | null;
@@ -101,7 +104,11 @@ export class SessionManager {
   private static readonly EMPTY_CACHE_COOLDOWN_MS = 5_000;
   private emptyCacheUntil = new Map<string, number>();
 
-  constructor(private opts: SessionManagerOptions) {}
+  private log: Logger;
+
+  constructor(private opts: SessionManagerOptions) {
+    this.log = opts.log ?? silentLogger();
+  }
 
   /**
    * Encrypt one plaintext for ALL of a peer's currently-known devices.
@@ -166,14 +173,31 @@ export class SessionManager {
    */
   async forgetPeerDevice(peerUserId: string, peerDeviceId: string): Promise<void> {
     const cached = this.bundleCache.get(peerUserId);
+    const before = cached ? cached.length : 0;
     if (cached) {
       const filtered = cached.filter((d) => d.deviceId !== peerDeviceId);
       if (filtered.length === 0) {
         this.bundleCache.delete(peerUserId);
         this.emptyCacheUntil.delete(peerUserId);
+        this.log.info("forgetPeerDevice: bundleCache entry deleted", {
+          peerUserId,
+          peerDeviceId,
+          before,
+        });
       } else {
         this.bundleCache.set(peerUserId, filtered);
+        this.log.info("forgetPeerDevice: device removed from bundleCache", {
+          peerUserId,
+          peerDeviceId,
+          before,
+          after: filtered.length,
+        });
       }
+    } else {
+      this.log.debug("forgetPeerDevice: no bundleCache entry to update", {
+        peerUserId,
+        peerDeviceId,
+      });
     }
     await this.opts.crypto.forgetSession(peerUserId, peerDeviceId);
   }
@@ -181,6 +205,33 @@ export class SessionManager {
   /** Test/diagnostic helper. */
   async hasSession(peerUserId: string, peerDeviceId: string): Promise<boolean> {
     return this.opts.crypto.hasSession(peerUserId, peerDeviceId);
+  }
+
+  /**
+   * Snapshot of internal state for chat.getDiagnostics(). No key material,
+   * no plaintext — just shape (counts + cooldown timestamps).
+   */
+  diagnostics(): {
+    bundleCache: Array<{ peerUserId: string; deviceCount: number; emptyCooldownExpiresAt?: number }>;
+    inflightClaimAll: string[];
+    inflightDiscovery: string[];
+  } {
+    const bundleCache = Array.from(this.bundleCache.entries()).map(([peerUserId, devices]) => {
+      const cooldown = this.emptyCacheUntil.get(peerUserId);
+      const entry: { peerUserId: string; deviceCount: number; emptyCooldownExpiresAt?: number } = {
+        peerUserId,
+        deviceCount: devices.length,
+      };
+      if (cooldown !== undefined && cooldown > Date.now()) {
+        entry.emptyCooldownExpiresAt = cooldown;
+      }
+      return entry;
+    });
+    return {
+      bundleCache,
+      inflightClaimAll: Array.from(this.inflightRefresh.keys()),
+      inflightDiscovery: Array.from(this.inflightDiscovery.keys()),
+    };
   }
 
   /**
@@ -204,8 +255,13 @@ export class SessionManager {
    * use the new bundles. Pops fresh OTKs server-side.
    */
   async refreshPeerBundles(peerUserId: string): Promise<ClaimedDevice[]> {
+    this.log.debug("refreshPeerBundles: claim_all", { peerUserId });
     const res = await this.opts.http.claimAll(this.opts.selfDeviceId, peerUserId);
     this.bundleCache.set(peerUserId, res.devices);
+    this.log.info("refreshPeerBundles: claim_all done", {
+      peerUserId,
+      deviceCount: res.devices.length,
+    });
     return res.devices;
   }
 
@@ -214,7 +270,10 @@ export class SessionManager {
   private async ensurePeerBundles(peerUserId: string): Promise<ClaimedDevice[]> {
     const cached = this.bundleCache.get(peerUserId);
     // Non-empty cache: hit. Use it.
-    if (cached && cached.length > 0) return cached;
+    if (cached && cached.length > 0) {
+      this.log.debug("ensurePeerBundles: cache hit", { peerUserId, deviceCount: cached.length });
+      return cached;
+    }
     // Empty cache (claim_all previously returned []): treat as a soft miss.
     // Re-claim, but throttled by EMPTY_CACHE_COOLDOWN_MS so we don't hammer
     // claim_all on a genuinely-empty peer (blocked, deleted account).
@@ -223,10 +282,20 @@ export class SessionManager {
     // instance was reconstructed (e.g., full page reload).
     if (cached && cached.length === 0) {
       const until = this.emptyCacheUntil.get(peerUserId) ?? 0;
-      if (Date.now() < until) return cached;
+      if (Date.now() < until) {
+        this.log.debug("ensurePeerBundles: empty cache still in cooldown", {
+          peerUserId,
+          cooldownRemainingMs: until - Date.now(),
+        });
+        return cached;
+      }
+      this.log.info("ensurePeerBundles: empty cache cooldown expired, re-claiming", { peerUserId });
     }
     const inflight = this.inflightRefresh.get(peerUserId);
-    if (inflight) return inflight;
+    if (inflight) {
+      this.log.debug("ensurePeerBundles: awaiting inflight claim_all", { peerUserId });
+      return inflight;
+    }
     const p = (async () => {
       try {
         const res = await this.refreshPeerBundles(peerUserId);
@@ -282,12 +351,20 @@ export class SessionManager {
       if (q && q.length < SessionManager.DISCOVERY_QUEUE_CAP) {
         q.push(plaintext);
       }
+      this.log.debug("discovery: queued plaintext for in-flight discovery", { peerUserId });
       return;
     }
 
     const floor = this.opts.backgroundDiscoveryFloorMs ?? 30_000;
     const lastAt = this.lastDiscoveryAt.get(peerUserId) ?? 0;
-    if (Date.now() - lastAt < floor) return;
+    if (Date.now() - lastAt < floor) {
+      this.log.debug("discovery: rate-limited", {
+        peerUserId,
+        remainingMs: floor - (Date.now() - lastAt),
+      });
+      return;
+    }
+    this.log.debug("discovery: starting", { peerUserId, knownDeviceCount: knownDevices.length });
 
     // Start a fresh discovery. Seed the queue with this plaintext —
     // additional concurrent sends append to it via the branch above.
@@ -328,10 +405,15 @@ export class SessionManager {
     peerUserId: string,
     knownDevices: ClaimedDevice[],
   ): Promise<void> {
+    this.log.debug("discovery: list_devices", { peerUserId });
     let live;
     try {
       live = await this.opts.http.listDevices(this.opts.selfDeviceId, peerUserId);
-    } catch {
+    } catch (err) {
+      this.log.warn("discovery: list_devices failed", {
+        peerUserId,
+        err: err instanceof Error ? err.message : String(err),
+      });
       return; // network blip; next send tries again after the floor
     }
 
@@ -343,7 +425,15 @@ export class SessionManager {
       )
       .map((d) => d.deviceId);
 
-    if (newDeviceIds.length === 0) return;
+    if (newDeviceIds.length === 0) {
+      this.log.debug("discovery: no new devices", { peerUserId, liveDeviceCount: live.devices.length });
+      return;
+    }
+    this.log.info("discovery: new peer device(s) detected", {
+      peerUserId,
+      newDeviceIds,
+      liveDeviceCount: live.devices.length,
+    });
 
     // Refresh bundleCache FIRST so post-refresh sends fanout naturally.
     let refreshed: ClaimedDevice[];

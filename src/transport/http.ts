@@ -66,6 +66,8 @@ export interface HttpClientOptions {
   fetchHttpBearer: FetchHttpBearer;
   /** Optional fetch implementation (defaults to globalThis.fetch). */
   fetchImpl?: typeof fetch;
+  /** Optional logger. Defaults to silent no-op. */
+  log?: import("../logging.js").Logger;
 }
 
 export class HttpError extends Error {
@@ -84,6 +86,7 @@ export class HttpClient {
   private readonly fetchToken: FetchChatToken;
   private readonly fetchHttpBearer: FetchHttpBearer;
   private readonly fetchImpl: typeof fetch;
+  private readonly log: import("../logging.js").Logger;
 
   // Cached MintTokenResponse, keyed by device id. Refreshed when expired.
   private cached: MintTokenResponse | null = null;
@@ -94,6 +97,11 @@ export class HttpClient {
     this.fetchToken = opts.fetchChatToken;
     this.fetchHttpBearer = opts.fetchHttpBearer;
     this.fetchImpl = opts.fetchImpl ?? globalThis.fetch.bind(globalThis);
+    // Lazy import to avoid circular dependency at construction time; the
+    // silent fallback means tests don't need to wire a logger.
+    this.log = opts.log ?? {
+      error: () => {}, warn: () => {}, info: () => {}, debug: () => {},
+    };
   }
 
   // ── token + node-url lifecycle ─────────────────────────────────────────────
@@ -151,11 +159,17 @@ export class HttpClient {
       headers["content-type"] = "application/json";
       bodyText = JSON.stringify(body);
     }
+    // Strip query string from path for logging (keep peerUserId for
+    // diagnosability but not the access_token if it were ever in URL).
+    const pathForLog = path.split("?")[0];
+    const t0 = Date.now();
+    this.log.debug(`http: ${method} ${pathForLog}`, { method, path: pathForLog });
     const res = await this.fetchImpl(`${this.apiBase}${path}`, {
       method,
       headers,
       body: bodyText,
     });
+    const elapsedMs = Date.now() - t0;
     if (!res.ok) {
       let code = "http_error";
       let msg = `${res.status} ${res.statusText}`;
@@ -166,10 +180,31 @@ export class HttpClient {
       } catch {
         // body wasn't JSON
       }
+      this.log.warn(`http: ${method} ${pathForLog} → ${res.status} ${code}`, {
+        method, path: pathForLog, status: res.status, code, elapsedMs,
+      });
       throw new HttpError(res.status, code, msg);
     }
-    if (res.status === 204) return undefined as T;
-    return (await res.json()) as T;
+    if (res.status === 204) {
+      this.log.debug(`http: ${method} ${pathForLog} → 204`, {
+        method, path: pathForLog, status: 204, elapsedMs,
+      });
+      return undefined as T;
+    }
+    const json = (await res.json()) as T;
+    // Surface response shape (counts only — no key material) for the
+    // endpoints that drive the "lots of list_devices" / claim_all spam.
+    let shape: Record<string, unknown> | undefined;
+    if (json && typeof json === "object") {
+      const j = json as Record<string, unknown>;
+      if (Array.isArray(j.devices)) shape = { deviceCount: (j.devices as unknown[]).length };
+      else if (Array.isArray(j.envelopes)) shape = { envelopeCount: (j.envelopes as unknown[]).length };
+      else if (typeof j.count === "number") shape = { count: j.count };
+    }
+    this.log.debug(`http: ${method} ${pathForLog} → ${res.status}`, {
+      method, path: pathForLog, status: res.status, elapsedMs, ...shape,
+    });
+    return json;
   }
 
   // ── keys ───────────────────────────────────────────────────────────────────

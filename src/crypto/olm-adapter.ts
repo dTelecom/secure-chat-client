@@ -22,6 +22,7 @@
 // identical class shape, so this file stays target-agnostic.
 import * as vodozemac from "#vodozemac";
 import { Account, Session, type InboundResult } from "#vodozemac";
+import { silentLogger, type Logger } from "../logging.js";
 import type { ClaimedDevice } from "../types.js";
 import type { KVStore } from "../store/interface.js";
 import type { CryptoAdapter, OutboundEnvelope, UploadBundle } from "./interface.js";
@@ -31,6 +32,8 @@ const OLM_SESSION_PREFIX = "olm/session/";
 
 export interface OlmAdapterOptions {
   store: KVStore;
+  /** Optional logger. Silent by default. */
+  log?: Logger;
 }
 
 // In Node, @dtelecom/vodozemac-wasm's pkg-node target initializes the
@@ -56,8 +59,11 @@ async function ensureWasmReady(): Promise<void> {
 export class OlmCryptoAdapter implements CryptoAdapter {
   private account: Account | null = null;
   private sessions = new Map<string, Session>();
+  private log: Logger;
 
-  constructor(private opts: OlmAdapterOptions) {}
+  constructor(private opts: OlmAdapterOptions) {
+    this.log = opts.log ?? silentLogger();
+  }
 
   async init(): Promise<void> {
     await ensureWasmReady();
@@ -110,6 +116,7 @@ export class OlmCryptoAdapter implements CryptoAdapter {
   ): Promise<OutboundEnvelope> {
     const acc = this.requireAccount();
     let session = await this.loadSession(peerUserId, peerDeviceId);
+    const hadSession = !!session;
     if (!session) {
       // Olm needs ONE remote curve25519 key to bootstrap; prefer OTK, fall
       // back to the per-device fallback prekey when the server's OTK pool
@@ -120,9 +127,13 @@ export class OlmCryptoAdapter implements CryptoAdapter {
     }
     const out = JSON.parse(session.encrypt(plaintext)) as { type: 0 | 1; body: string };
     await this.persistSession(peerUserId, peerDeviceId, session);
+    const msgType = out.type === 0 ? "prekey" : "normal";
+    this.log.debug("crypto.encryptForPeer", {
+      peerUserId, peerDeviceId, msgType, hadSession,
+    });
     return {
       ciphertext: out.body,
-      msgType: out.type === 0 ? "prekey" : "normal",
+      msgType,
     };
   }
 
@@ -135,27 +146,49 @@ export class OlmCryptoAdapter implements CryptoAdapter {
     const acc = this.requireAccount();
     let session = await this.loadSession(peerUserId, peerDeviceId);
     const isPrekey = msgType === "prekey";
+    const hadSession = !!session;
 
     if (!session) {
       if (!isPrekey) {
+        this.log.warn("crypto.decryptFromPeer: no session for normal-type", { peerUserId, peerDeviceId });
         throw new Error(`no session for normal-type ciphertext from ${peerUserId}/${peerDeviceId}`);
       }
       // Inbound bootstrap: vodozemac extracts the sender's identity key
       // from the prekey message itself; createInboundSession both creates
       // the session AND decrypts the initial message in one call.
-      const inbound: InboundResult = acc.createInboundSession(ciphertext);
-      session = inbound.takeSession();
-      const plaintext = inbound.plaintext;
-      await this.persistAccount();
-      this.sessions.set(sessionKey(peerUserId, peerDeviceId), session);
-      await this.persistSession(peerUserId, peerDeviceId, session);
-      return plaintext;
+      try {
+        const inbound: InboundResult = acc.createInboundSession(ciphertext);
+        session = inbound.takeSession();
+        const plaintext = inbound.plaintext;
+        await this.persistAccount();
+        this.sessions.set(sessionKey(peerUserId, peerDeviceId), session);
+        await this.persistSession(peerUserId, peerDeviceId, session);
+        this.log.info("crypto.decryptFromPeer: bootstrapped inbound session", {
+          peerUserId, peerDeviceId,
+        });
+        return plaintext;
+      } catch (err) {
+        this.log.error("crypto.decryptFromPeer: bootstrap failed", {
+          peerUserId, peerDeviceId, msgType,
+          err: err instanceof Error ? err.message : String(err),
+        });
+        throw err;
+      }
     }
 
     const olmType = isPrekey ? 0 : 1;
-    const plaintext = session.decrypt(olmType, ciphertext);
-    await this.persistSession(peerUserId, peerDeviceId, session);
-    return plaintext;
+    try {
+      const plaintext = session.decrypt(olmType, ciphertext);
+      await this.persistSession(peerUserId, peerDeviceId, session);
+      this.log.debug("crypto.decryptFromPeer: ok", { peerUserId, peerDeviceId, msgType });
+      return plaintext;
+    } catch (err) {
+      this.log.error("crypto.decryptFromPeer: decrypt failed", {
+        peerUserId, peerDeviceId, msgType, hadSession,
+        err: err instanceof Error ? err.message : String(err),
+      });
+      throw err;
+    }
   }
 
   async forgetSession(peerUserId: string, peerDeviceId: string): Promise<void> {

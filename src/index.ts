@@ -28,6 +28,8 @@ import { ConversationIndex } from "./conversations.js";
 export type { Conversation } from "./conversations.js";
 import type { Conversation } from "./conversations.js";
 import { EnvelopeDedup } from "./envelope_dedup.js";
+import { LogContext, type LogEvent, type Logger, type LogLevel } from "./logging.js";
+export type { LogLevel, LogEvent } from "./logging.js";
 import { Outbox } from "./outbox.js";
 import { SessionManager } from "./sessions.js";
 import { StatusTracker, type MessageStatus } from "./status.js";
@@ -100,6 +102,54 @@ export interface ConnectOptions {
    *  entirely. The bundleCache is only refreshed on reconnect or via
    *  explicit `refreshPeerBundles` (caller-driven). Default `true`. */
   backgroundDiscovery?: boolean;
+  /**
+   * Console log level for SDK internals. Off by default (`"silent"`).
+   *
+   * Levels (each level includes everything above):
+   *  - `"silent"` — no console output (default)
+   *  - `"error"`  — only failures
+   *  - `"warn"`   — failures + suspicious states
+   *  - `"info"`   — major lifecycle events (WS open/close, cache transitions)
+   *  - `"debug"`  — every HTTP call, every decrypt, every dedup hit
+   *
+   * Without this opt-in, you can also enable from the browser console:
+   *   `localStorage.setItem("@dtelecom/secure-chat-client:debug", "debug")`
+   * then reload. Useful for diagnosing a deployed app without redeploy.
+   *
+   * Independent of console output, the SDK ALWAYS keeps the last ~256
+   * events in an in-memory ring buffer accessible via
+   * {@link DTelecomSecureChat.getDiagnostics}. Bug reports can capture
+   * that snapshot without devtools access.
+   */
+  debug?: LogLevel;
+}
+
+/**
+ * Snapshot of internal SDK state for debugging. Returned by
+ * {@link DTelecomSecureChat.getDiagnostics}. Safe to dump into a bug
+ * report — no ciphertext, no private keys, no plaintext message content.
+ */
+export interface ChatDiagnostics {
+  /** Resolved log level (after ConnectOptions / localStorage merge). */
+  logLevel: LogLevel;
+  /** This SDK instance's user + device. */
+  selfUserId: string | null;
+  deviceId: string;
+  /** True iff this tab owns the WebSocket lock (false on secondary tabs). */
+  isPrimary: boolean;
+  /** Underlying WebSocket state. */
+  wsState: ConnectionState;
+  /** Per-peer bundleCache state (no key material — just shape). */
+  bundleCache: Array<{ peerUserId: string; deviceCount: number; emptyCooldownExpiresAt?: number }>;
+  /** Per-peer device-list cache (fetched via list_devices). */
+  peerDevicesCache: Array<{ peerUserId: string; deviceCount: number; fetchedAt: number }>;
+  /** In-flight background ops, by peerUserId. */
+  inflightClaimAll: string[];
+  inflightDiscovery: string[];
+  /** Total envelopeUuids in the persisted dedup set. */
+  envelopeDedupSize: number;
+  /** Most-recent log events (oldest first), bounded by the ring cap. */
+  recentEvents: LogEvent[];
 }
 
 // ── public event types ──────────────────────────────────────────────────────
@@ -453,6 +503,8 @@ export class DTelecomSecureChat {
   private sessions!: SessionManager;
   private peerDevices!: PeerDeviceCache;
   private messages!: MessageStore;
+  private logCtx!: LogContext;
+  private log!: Logger;
   private conversations!: ConversationIndex;
   private status!: StatusTracker;
   private envelopeDedup!: EnvelopeDedup;
@@ -992,6 +1044,43 @@ export class DTelecomSecureChat {
     return this.conversations.totalUnread();
   }
 
+  /**
+   * Snapshot of internal SDK state for debugging. Safe to dump into a
+   * bug report — no ciphertext, no key material, no plaintext message
+   * content. See {@link ChatDiagnostics} for the shape.
+   *
+   * Useful flows:
+   *
+   * - User reports "messages don't appear": call this, look at
+   *   `bundleCache` (does the peer have any cached devices?),
+   *   `envelopeDedupSize` (is dedup unusually large?), and
+   *   `recentEvents` for the last ~256 internal log lines.
+   *
+   * - User reports "tons of network requests": call this, grep
+   *   `recentEvents` for `[http]` lines to count claim_all /
+   *   list_devices firings and see what triggered them.
+   *
+   * Independent of `ConnectOptions.debug`. The recent-events ring
+   * buffer is always populated.
+   */
+  getDiagnostics(): ChatDiagnostics {
+    const sessionsDiag = this.sessions.diagnostics();
+    const peerDevicesDiag = this.peerDevices.diagnostics();
+    return {
+      logLevel: this.logCtx.getLevel(),
+      selfUserId: this.selfUserId,
+      deviceId: this.deviceId,
+      isPrimary: this.isPrimaryFlag,
+      wsState: this.wsState,
+      bundleCache: sessionsDiag.bundleCache,
+      peerDevicesCache: peerDevicesDiag,
+      inflightClaimAll: sessionsDiag.inflightClaimAll,
+      inflightDiscovery: sessionsDiag.inflightDiscovery,
+      envelopeDedupSize: this.envelopeDedup.size(),
+      recentEvents: this.logCtx.recentEvents(),
+    };
+  }
+
   // ── internals: block-list persistence ──────────────────────────────────────
 
   private async loadBlockedUserIds(): Promise<void> {
@@ -1048,6 +1137,14 @@ export class DTelecomSecureChat {
     }
     this.selfUserId = opts.selfUserId;
 
+    // Build the log context BEFORE anything else so even the early
+    // bootstrap steps are captured in the ring buffer. The console-emit
+    // gate respects opts.debug / localStorage; if neither is set we're
+    // silent on console but still recording to the ring (cheap; bounded).
+    this.logCtx = new LogContext(opts.debug);
+    this.log = this.logCtx.makeLogger("sdk");
+    this.log.info("bootstrap", { selfUserId: this.selfUserId, level: this.logCtx.getLevel() });
+
     // Wrap the consumer-provided store with a per-user scope BEFORE any
     // subsystem touches it. All persisted SDK state (deviceId, Olm pickle,
     // Olm sessions, message store, conversation index, key-bundle cache,
@@ -1064,7 +1161,10 @@ export class DTelecomSecureChat {
     await migrateLegacyKeys(rawStore, this.selfUserId);
     this.store = new ScopedKVStore(rawStore, this.selfUserId);
 
-    this.crypto = opts.crypto ?? new OlmCryptoAdapter({ store: this.store });
+    this.crypto = opts.crypto ?? new OlmCryptoAdapter({
+      store: this.store,
+      log: this.logCtx.makeLogger("crypto"),
+    });
     await this.crypto.init();
 
     this.deviceId = await loadOrCreateDeviceId(this.store);
@@ -1073,6 +1173,7 @@ export class DTelecomSecureChat {
       apiBaseURL: opts.apiBaseURL,
       fetchChatToken: opts.fetchChatToken,
       fetchHttpBearer: opts.fetchHttpBearer,
+      log: this.logCtx.makeLogger("http"),
       ...(opts.fetchImpl ? { fetchImpl: opts.fetchImpl } : {}),
     });
 
@@ -1101,6 +1202,7 @@ export class DTelecomSecureChat {
       crypto: this.crypto,
       selfDeviceId: this.deviceId,
       selfUserId: this.selfUserId,
+      log: this.logCtx.makeLogger("sessions"),
       // Background discovery: every outbound encrypt kicks off a cheap
       // list_devices in parallel; if a peer has a device the bundleCache
       // didn't know about, the SAME plaintext is encrypted for it and
@@ -1122,7 +1224,7 @@ export class DTelecomSecureChat {
     // EnvelopeDedup must hydrate BEFORE drainPending or any inbound frame
     // processing — see handleInboundCiphertext for why duplicate-decrypt
     // before dedup is hydrated would corrupt the Olm session.
-    this.envelopeDedup = new EnvelopeDedup(this.store);
+    this.envelopeDedup = new EnvelopeDedup(this.store, this.logCtx.makeLogger("dedup"));
     await this.envelopeDedup.init();
     // Hydrate the block list — KV first (best-effort), then overlay any
     // caller-provided initial value so the explicit option wins.
@@ -1321,12 +1423,16 @@ export class DTelecomSecureChat {
    * outbound sends and re-pull pending offline envelopes — closes the
    * gap during disconnect.
    */
+  private wsState: ConnectionState = "closed";
+
   private onWsState(s: string): void {
     // Surface the state change to apps so the UI can render an offline /
     // reconnecting banner. Collapse the transient "closing" step into
     // "closed" — apps don't care about the difference.
     const exposed: ConnectionState =
       s === "open" ? "open" : s === "reconnecting" ? "reconnecting" : s === "connecting" ? "connecting" : "closed";
+    this.wsState = exposed;
+    this.log.info("ws state", { state: exposed });
     this.dispatch("connectionStateChange", { state: exposed });
 
     if (s !== "open") return;
@@ -1417,6 +1523,13 @@ export class DTelecomSecureChat {
     msgType: "prekey" | "normal";
     source: "live" | "drain";
   }): Promise<void> {
+    this.log.debug("delivery: inbound", {
+      envelopeUuid: opts.envelopeUuid,
+      peerUserId: opts.peerUserId,
+      peerDeviceId: opts.peerDeviceId,
+      msgType: opts.msgType,
+      source: opts.source,
+    });
     // Pre-decrypt dedup. Two delivery paths plus sender-side retries make
     // duplicates expected — see EnvelopeDedup for the rationale.
     if (await this.envelopeDedup.has(opts.envelopeUuid)) {
@@ -1425,6 +1538,7 @@ export class DTelecomSecureChat {
       // first ack got lost in transit (e.g., reconnect dropped the
       // pending ack send).
       if (opts.source === "live") {
+        this.log.debug("delivery: dedup hit → re-ack", { envelopeUuid: opts.envelopeUuid });
         this.ws.sendEnvelopeAck({
           envelopeUuid: opts.envelopeUuid,
           senderUserId: opts.peerUserId,

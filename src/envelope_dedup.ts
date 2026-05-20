@@ -15,6 +15,7 @@
 // never 1000+ envelopes apart — the cap exists to bound storage, not to
 // dedupe across long windows.
 
+import { silentLogger, type Logger } from "./logging.js";
 import type { KVStore } from "./store/interface.js";
 
 const KEY_PREFIX = "envelopeDedup/";
@@ -25,8 +26,16 @@ export class EnvelopeDedup {
   // order, which we use as the LRU eviction order.
   private cache = new Map<string, number>(); // uuid → addedAtMs
   private initialized = false;
+  private log: Logger;
 
-  constructor(private store: KVStore) {}
+  constructor(private store: KVStore, log?: Logger) {
+    this.log = log ?? silentLogger();
+  }
+
+  /** For chat.getDiagnostics() — size only, no uuids leaked. */
+  size(): number {
+    return this.cache.size;
+  }
 
   /**
    * Hydrate from persisted storage. Idempotent — safe to call from any
@@ -56,7 +65,9 @@ export class EnvelopeDedup {
   /** True if this envelopeUuid has been seen (and added) before. */
   async has(uuid: string): Promise<boolean> {
     if (!this.initialized) await this.init();
-    return this.cache.has(uuid);
+    const hit = this.cache.has(uuid);
+    if (hit) this.log.debug("dedup.has: hit (dropping duplicate)", { uuid });
+    return hit;
   }
 
   /**
@@ -73,6 +84,7 @@ export class EnvelopeDedup {
     if (this.cache.size > CAP) {
       await this.trim();
     }
+    this.log.debug("dedup.add", { uuid, size: this.cache.size });
   }
 
   /**
@@ -90,6 +102,9 @@ export class EnvelopeDedup {
     if (!this.cache.has(uuid)) return;
     this.cache.delete(uuid);
     await this.store.delete(KEY_PREFIX + uuid);
+    this.log.info("dedup.remove (rollback on processing failure)", {
+      uuid, size: this.cache.size,
+    });
   }
 
   /** Drop oldest entries until size ≤ CAP. */

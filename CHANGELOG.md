@@ -13,6 +13,49 @@ control — there is no broad-deployment compat negotiation.
 
 ---
 
+## [0.13.0] — 2026-05-20
+
+### Added
+
+- **Diagnostic logging**. New `ConnectOptions.debug` field accepts
+  `"silent" | "error" | "warn" | "info" | "debug"`. Off by default.
+  Can also be enabled at runtime without code change by setting
+  `localStorage["@dtelecom/secure-chat-client:debug"] = "debug"` in
+  the browser console and reloading. Critical paths now log:
+  - `[http]` every HTTP call (method, path, status, response shape)
+  - `[sessions]` bundleCache transitions, claim_all,
+    forgetPeerDevice, empty-cache cooldown decisions
+  - `[crypto]` decrypt attempts + outcomes, session bootstraps
+  - `[dedup]` add/has/remove on `EnvelopeDedup`
+  - `[delivery]` inbound envelope flow + ack decisions
+  - `[discovery]` list_devices firings + new-device detection
+  - `[sdk]` WebSocket state transitions
+
+- **`chat.getDiagnostics(): ChatDiagnostics`**. Returns a snapshot of
+  internal SDK state: bundleCache (per-peer device counts +
+  cooldowns), peerDevicesCache, in-flight claim_all / discovery
+  ops, envelopeDedup size, WS state, recent log events. Safe to
+  dump into a bug report — no ciphertext, no key material, no
+  plaintext message content.
+
+- **Ring buffer of recent events** (always-on, 256-entry cap,
+  bounded memory). Independent of console logging — every log call
+  goes into the ring regardless of level. Surfaced via
+  `getDiagnostics().recentEvents`.
+
+### Changed
+
+- `LogLevel` and `LogEvent` types exported from the package root
+  for typed handling in FE code.
+
+### Compatibility
+
+SDK-only. No node, wire-protocol, or behavior change. Default state
+(no `debug` option, no localStorage key) emits zero console output —
+fully backward-compatible with 0.12.x.
+
+---
+
 ## [0.12.1] — 2026-05-20
 
 ### Fixed
@@ -358,6 +401,7 @@ Initial release. Core surface:
   `typing`, `statusChange`, `peerNewDevice`
 - Olm + vodozemac WASM crypto, MMKV / web / memory KV adapters.
 
+[0.13.0]: https://github.com/dTelecom/secure-chat-client/releases/tag/v0.13.0
 [0.12.1]: https://github.com/dTelecom/secure-chat-client/releases/tag/v0.12.1
 [0.12.0]: https://github.com/dTelecom/secure-chat-client/releases/tag/v0.12.0
 [0.11.0]: https://github.com/dTelecom/secure-chat-client/releases/tag/v0.11.0
