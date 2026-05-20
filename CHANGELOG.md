@@ -13,6 +13,61 @@ control — there is no broad-deployment compat negotiation.
 
 ---
 
+## [0.12.1] — 2026-05-20
+
+### Fixed
+
+- **`peer_unreachable` after a decrypt failure**.
+  `SessionManager.forgetPeerDevice` left the `bundleCache` as `[]` when
+  the filter removed the only entry. `ensurePeerBundles` then returned
+  `[]` from cache without re-claiming, so every subsequent send threw
+  `peer_unreachable` until the SDK instance was reconstructed (full
+  page reload). The fix DELETES the cache entry when the filter
+  empties it, so the next send re-claims.
+
+  Additionally, `ensurePeerBundles` now treats `cached.length === 0`
+  as a soft miss with a 5-second cooldown — re-claims on the next
+  send after the cooldown expires. Bounds load on a genuinely-empty
+  peer (blocked, deleted account) while allowing transient empties
+  to resolve in seconds rather than requiring an SDK rebuild.
+
+- **Lost messages from envelope dedup poisoning**.
+  `EnvelopeDedup.add()` ran BEFORE decrypt in `handleInboundCiphertext`.
+  When decrypt or `dispatchInboundEvent` failed (e.g., Olm session
+  corruption from the cache bug above), the catch path threw and left
+  the uuid permanently marked as "seen" in the persisted dedup. Every
+  subsequent sender-retry of the same envelope was dropped pre-decrypt
+  → message never reached the peer's `message` event or the store.
+  Survived across page reloads (dedup is persisted in scoped KV).
+
+  Fix: new `EnvelopeDedup.remove()`. The receive path now wraps the
+  decrypt+dispatch flow and rolls back the dedup entry on failure, so
+  the at-least-once delivery layer (sender retries + post-webhook
+  publish + `drainPending` on next reconnect) can retry the
+  envelope. The pre-decrypt add still guards against concurrent
+  processing of the same envelope (Olm replay protection).
+
+- **`list_devices` spam during normal chat**.
+  Root cause was the decrypt-failure recovery path
+  (`peerDevices.invalidate + refresh`) firing one
+  `GET /keys/list_devices` per failed envelope. Each failure was
+  driven by the dedup-poisoning bug above. With the dedup fix the
+  cascade stops — receivers can now decrypt and the recovery path
+  fires once at most (transient Olm session resets), not per-message.
+
+### Added
+
+- `EnvelopeDedup.remove(uuid)` (internal). Used by the SDK to roll
+  back a uuid when decrypt/dispatch fails; no host-app use.
+
+### Compatibility
+
+SDK-only. No node or wire-protocol change. Works against the same
+dtelecom-node v1.1+ that 0.11/0.12 already require. Existing apps
+can upgrade without coordination.
+
+---
+
 ## [0.12.0] — 2026-05-20
 
 ### Added
@@ -303,6 +358,7 @@ Initial release. Core surface:
   `typing`, `statusChange`, `peerNewDevice`
 - Olm + vodozemac WASM crypto, MMKV / web / memory KV adapters.
 
+[0.12.1]: https://github.com/dTelecom/secure-chat-client/releases/tag/v0.12.1
 [0.12.0]: https://github.com/dTelecom/secure-chat-client/releases/tag/v0.12.0
 [0.11.0]: https://github.com/dTelecom/secure-chat-client/releases/tag/v0.11.0
 [0.10.0]: https://github.com/dTelecom/secure-chat-client/releases/tag/v0.10.0

@@ -1433,36 +1433,18 @@ export class DTelecomSecureChat {
       }
       return;
     }
-    // Reserve the uuid BEFORE decrypt so a crash mid-decrypt doesn't
-    // leave the Olm session in a state where the next process-restart
-    // would try to decrypt the same ciphertext again and fail with a
-    // replay error (which the existing recovery path treats as session
-    // corruption). The drain path will re-add on the next run; in the
-    // case of true new envelopes this is just a tiny extra write.
+    // Reserve the uuid BEFORE decrypt so two concurrent deliveries of the
+    // same envelope (live WS + drainPending race) don't both attempt
+    // decrypt — the second would fail Olm replay and corrupt the
+    // session. If decrypt or dispatch fails, we ROLL BACK the dedup
+    // entry in the catch block so a retry / drainPending on next
+    // reconnect can try again. Without that rollback, a single decrypt
+    // failure permanently poisoned the dedup and silently dropped every
+    // subsequent redelivery of the same envelope (bug fixed in 0.12.1).
     await this.envelopeDedup.add(opts.envelopeUuid);
 
-    let plaintext: string;
     try {
-      plaintext = await this.sessions.decrypt(
-        opts.peerUserId,
-        opts.peerDeviceId,
-        opts.ciphertext,
-        opts.msgType,
-      );
-    } catch (firstErr) {
-      // On-decrypt-failure recovery: drop the broken session, refresh the
-      // peer's device list (peer may have a new device whose fingerprint
-      // doesn't match our cache), retry decrypt once. For msgType=prekey
-      // the retry can succeed by bootstrapping a fresh inbound session;
-      // for msgType=normal a forgotten session can't recover this message,
-      // but the next inbound from peer arrives as prekey-type and rebuilds.
-      await this.sessions.forgetPeerDevice(opts.peerUserId, opts.peerDeviceId);
-      this.peerDevices.invalidate(opts.peerUserId);
-      try {
-        await this.peerDevices.refresh(opts.peerUserId);
-      } catch {
-        // refresh is best-effort; carry on with retry regardless
-      }
+      let plaintext: string;
       try {
         plaintext = await this.sessions.decrypt(
           opts.peerUserId,
@@ -1470,20 +1452,49 @@ export class DTelecomSecureChat {
           opts.ciphertext,
           opts.msgType,
         );
-      } catch {
-        // Still broken — drop. Future messages from peer will re-bootstrap.
-        throw firstErr;
+      } catch (firstErr) {
+        // On-decrypt-failure recovery: drop the broken session, refresh the
+        // peer's device list (peer may have a new device whose fingerprint
+        // doesn't match our cache), retry decrypt once. For msgType=prekey
+        // the retry can succeed by bootstrapping a fresh inbound session;
+        // for msgType=normal a forgotten session can't recover this message,
+        // but the next inbound from peer arrives as prekey-type and rebuilds.
+        await this.sessions.forgetPeerDevice(opts.peerUserId, opts.peerDeviceId);
+        this.peerDevices.invalidate(opts.peerUserId);
+        try {
+          await this.peerDevices.refresh(opts.peerUserId);
+        } catch {
+          // refresh is best-effort; carry on with retry regardless
+        }
+        try {
+          plaintext = await this.sessions.decrypt(
+            opts.peerUserId,
+            opts.peerDeviceId,
+            opts.ciphertext,
+            opts.msgType,
+          );
+        } catch {
+          // Still broken — drop. Future messages from peer will re-bootstrap.
+          throw firstErr;
+        }
       }
-    }
-    // Plan §17 prekey-discovery: if this peer device wasn't known to the
-    // local cache before, refresh + emit peerNewDevice. Done after a
-    // successful decrypt so we only learn about devices that produced
-    // valid messages (not random spammers attempting random sessions).
-    await this.maybeAnnouncePeerDevice(opts.peerUserId, opts.peerDeviceId);
+      // Plan §17 prekey-discovery: if this peer device wasn't known to the
+      // local cache before, refresh + emit peerNewDevice. Done after a
+      // successful decrypt so we only learn about devices that produced
+      // valid messages (not random spammers attempting random sessions).
+      await this.maybeAnnouncePeerDevice(opts.peerUserId, opts.peerDeviceId);
 
-    const event = decodeEventBytes(new TextEncoder().encode(plaintext));
-    if (!event) return; // unknown / malformed: drop silently
-    await this.dispatchInboundEvent(opts.peerUserId, opts.peerDeviceId, event);
+      const event = decodeEventBytes(new TextEncoder().encode(plaintext));
+      if (!event) return; // unknown / malformed: drop silently (dedup STAYS — replaying won't help)
+      await this.dispatchInboundEvent(opts.peerUserId, opts.peerDeviceId, event);
+    } catch (err) {
+      // Decrypt or dispatch failed irrecoverably. Roll back the dedup
+      // entry so the at-least-once layer (sender retry / drainPending
+      // on next reconnect) can retry processing. Olm replay protection
+      // still guards the in-process race via the pre-decrypt add above.
+      await this.envelopeDedup.remove(opts.envelopeUuid).catch(() => {});
+      throw err;
+    }
 
     // ack-after-store: dispatchInboundEvent has just persisted the event
     // (text → messages.put, etc.). The chatEnvelopeAck signals the node

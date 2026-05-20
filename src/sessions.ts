@@ -92,6 +92,15 @@ export class SessionManager {
   // fresh bundleCache for natural fanout and don't need catch-up.
   private pendingCatchUp = new Map<string, string[]>();
 
+  // When ensurePeerBundles observes a cached EMPTY result (claim_all
+  // returned no devices), we keep it cached for this short window before
+  // re-claiming. Bounds load on a permanently-empty peer (blocked,
+  // deleted account) while letting a transient empty resolve within
+  // seconds rather than requiring a full SDK reconstruction. Added in
+  // 0.12.1 as defense against any path that leaves [] in bundleCache.
+  private static readonly EMPTY_CACHE_COOLDOWN_MS = 5_000;
+  private emptyCacheUntil = new Map<string, number>();
+
   constructor(private opts: SessionManagerOptions) {}
 
   /**
@@ -147,14 +156,24 @@ export class SessionManager {
   /**
    * Drop the cached bundle list and any session with this peer device.
    * Used on decrypt-failure recovery, before a re-claim.
+   *
+   * Critical (0.12.1): when the filter produces an empty array, we
+   * DELETE the cache entry entirely instead of leaving []. Otherwise
+   * the next `ensurePeerBundles` would short-circuit on the empty
+   * cache and return [] without re-claiming — which is the bug that
+   * stuck users in peer_unreachable after a decrypt failure (typically
+   * triggered by the peer rotating their device).
    */
   async forgetPeerDevice(peerUserId: string, peerDeviceId: string): Promise<void> {
     const cached = this.bundleCache.get(peerUserId);
     if (cached) {
-      this.bundleCache.set(
-        peerUserId,
-        cached.filter((d) => d.deviceId !== peerDeviceId),
-      );
+      const filtered = cached.filter((d) => d.deviceId !== peerDeviceId);
+      if (filtered.length === 0) {
+        this.bundleCache.delete(peerUserId);
+        this.emptyCacheUntil.delete(peerUserId);
+      } else {
+        this.bundleCache.set(peerUserId, filtered);
+      }
     }
     await this.opts.crypto.forgetSession(peerUserId, peerDeviceId);
   }
@@ -194,12 +213,32 @@ export class SessionManager {
 
   private async ensurePeerBundles(peerUserId: string): Promise<ClaimedDevice[]> {
     const cached = this.bundleCache.get(peerUserId);
-    if (cached) return cached;
+    // Non-empty cache: hit. Use it.
+    if (cached && cached.length > 0) return cached;
+    // Empty cache (claim_all previously returned []): treat as a soft miss.
+    // Re-claim, but throttled by EMPTY_CACHE_COOLDOWN_MS so we don't hammer
+    // claim_all on a genuinely-empty peer (blocked, deleted account).
+    // Before 0.12.1 the SDK returned [] from the cache here without re-
+    // claiming, which stuck the SDK in peer_unreachable until the SDK
+    // instance was reconstructed (e.g., full page reload).
+    if (cached && cached.length === 0) {
+      const until = this.emptyCacheUntil.get(peerUserId) ?? 0;
+      if (Date.now() < until) return cached;
+    }
     const inflight = this.inflightRefresh.get(peerUserId);
     if (inflight) return inflight;
     const p = (async () => {
       try {
-        return await this.refreshPeerBundles(peerUserId);
+        const res = await this.refreshPeerBundles(peerUserId);
+        if (res.length === 0) {
+          this.emptyCacheUntil.set(
+            peerUserId,
+            Date.now() + SessionManager.EMPTY_CACHE_COOLDOWN_MS,
+          );
+        } else {
+          this.emptyCacheUntil.delete(peerUserId);
+        }
+        return res;
       } finally {
         this.inflightRefresh.delete(peerUserId);
       }

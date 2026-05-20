@@ -153,25 +153,55 @@ describe("SessionManager — backgroundDiscovery: false (legacy behavior)", () =
     expect(claimAllCalls).toBe(2);
   });
 
-  it("forgetPeerDevice empties the entry but doesn't auto-claim — refresh still needed", async () => {
+  it("forgetPeerDevice — when filter would empty the cache, the entry is DELETED so next send auto-claims (0.12.1)", async () => {
     const alice = makeAlice();
     await alice.encryptForPeer("bob", "warm-up");
     expect(claimAllCalls).toBe(1);
 
+    // Bob's "new" claim_all response: bob-A is back AND there's a bob-B
+    // we didn't know about yet. After forgetPeerDevice empties the cache,
+    // the next encryptForPeer should auto-claim and find both.
     claimAllResp = [makeBundle("bob-A"), makeBundle("bob-B")];
 
-    let out = await alice.encryptForPeer("bob", "before");
-    expect(out.map((e) => e.peerDeviceId)).toEqual(["bob-A"]);
-    expect(claimAllCalls).toBe(1);
-
+    // forgetPeerDevice removes bob-A. The cache had only bob-A (single
+    // entry from the warm-up), so the filtered array is []. Before
+    // 0.12.1 the SDK would set cache=[] and stick there until the next
+    // refresh. After 0.12.1: cache entry is DELETED, so the next
+    // ensurePeerBundles re-claims.
     await alice.forgetPeerDevice("bob", "bob-A");
-    out = await alice.encryptForPeer("bob", "after-forget");
+    const out = await alice.encryptForPeer("bob", "after-forget");
+    // Auto-claim fired — encryptForPeer picks up both devices now.
+    expect(out.map((e) => e.peerDeviceId).sort()).toEqual(["bob-A", "bob-B"]);
+    expect(claimAllCalls).toBe(2);
+  });
+
+  it("empty claim_all is cached briefly to avoid hammering, then re-claims (0.12.1)", async () => {
+    const alice = makeAlice();
+    // Simulate a peer with no devices right now (signed out, deleted, blocked).
+    claimAllResp = [];
+
+    let out = await alice.encryptForPeer("bob", "first");
     expect(out).toEqual([]);
     expect(claimAllCalls).toBe(1);
 
-    await alice.refreshPeerBundles("bob");
-    out = await alice.encryptForPeer("bob", "after-refresh");
-    expect(out.map((e) => e.peerDeviceId).sort()).toEqual(["bob-A", "bob-B"]);
+    // Immediate retry: hits cooldown, no new HTTP call.
+    out = await alice.encryptForPeer("bob", "burst");
+    expect(out).toEqual([]);
+    expect(claimAllCalls).toBe(1);
+
+    // Peer comes back online with a device. Bundle cache is still cooling
+    // down for another ~5s, so we have to wait — but a fresh send AFTER
+    // the cooldown re-claims and finds the new device.
+    claimAllResp = [makeBundle("bob-A")];
+
+    // Skip time by manipulating the internal cooldown map for the test.
+    // (In production: the 5s cooldown auto-expires.)
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (alice as any).emptyCacheUntil.set("bob", 0);
+
+    out = await alice.encryptForPeer("bob", "post-cooldown");
+    expect(out.map((e) => e.peerDeviceId)).toEqual(["bob-A"]);
+    expect(claimAllCalls).toBe(2);
   });
 });
 

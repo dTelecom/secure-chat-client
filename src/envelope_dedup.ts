@@ -75,6 +75,23 @@ export class EnvelopeDedup {
     }
   }
 
+  /**
+   * Roll back a previously-added uuid. Called by the SDK when decrypt
+   * or dispatch failed AFTER the pre-decrypt add, so the at-least-once
+   * delivery layer (sender retries + post-webhook publish + drainPending
+   * on next reconnect) can attempt re-processing. Without this, a single
+   * decrypt failure permanently poisons the dedup and the message is
+   * lost on every redelivery.
+   *
+   * No-op if the uuid isn't in the cache.
+   */
+  async remove(uuid: string): Promise<void> {
+    if (!this.initialized) await this.init();
+    if (!this.cache.has(uuid)) return;
+    this.cache.delete(uuid);
+    await this.store.delete(KEY_PREFIX + uuid);
+  }
+
   /** Drop oldest entries until size ≤ CAP. */
   private async trim(): Promise<void> {
     while (this.cache.size > CAP) {
