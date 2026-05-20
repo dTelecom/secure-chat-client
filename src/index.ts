@@ -362,6 +362,28 @@ function toChatError(err: unknown): ChatError {
 }
 
 /**
+ * Detects vodozemac's "unknown one-time key" error message thrown by
+ * `Account.createInboundSession` when the prekey-message references an
+ * OTK that no longer exists in our local Account's pool.
+ *
+ * This is structurally terminal: no number of retries can resurrect a
+ * private key that was consumed (one-time use, by design) or that was
+ * lost (e.g., IndexedDB wiped on this device). The matching envelope
+ * should be HTTP-acked to clear it from the backend's pending queue —
+ * otherwise drainPending re-attempts it on every reconnect forever,
+ * filling logs with errors that can't be acted on.
+ *
+ * Other Olm error variants (bad MAC, ratchet out of sync, no session
+ * for normal-type) are NOT treated as terminal here: those CAN recover
+ * via the SDK's existing decrypt-failure path (forgetPeerDevice +
+ * refresh + retry).
+ */
+function isUnknownOtkError(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  return /unknown one-time key/i.test(err.message);
+}
+
+/**
  * High-level WebSocket connection state for the chat tab to render
  * "Offline" / "Reconnecting…" banners. Maps directly to the underlying
  * `WsClient` state machine; `"closing"` is collapsed into `"closed"`
@@ -1467,8 +1489,34 @@ export class DTelecomSecureChat {
               source: "drain",
             });
             ackUuids.push(env.envelopeUuid);
-          } catch {
-            // decrypt failed — leave on the queue for now.
+          } catch (err) {
+            // Terminal failures: HTTP-ack to clear the queue. Otherwise
+            // drainPending would re-attempt the same unrecoverable
+            // ciphertext on every reconnect, filling logs with errors
+            // that can't be acted on. See isUnknownOtkError JSDoc.
+            //
+            // Transient failures (everything else) keep the envelope on
+            // the queue so a future reconnect can retry — the SDK's
+            // decrypt-failure recovery path (forgetPeerDevice + refresh
+            // + retry inside handleInboundCiphertext) can fix some of
+            // those, but if it can't, this drain attempt is a no-op.
+            if (isUnknownOtkError(err)) {
+              this.log.warn(
+                "delivery: envelope permanently undecryptable (unknown OTK), acking to clear queue",
+                {
+                  envelopeUuid: env.envelopeUuid,
+                  peerUserId: env.senderUserId,
+                  peerDeviceId: env.senderDeviceId,
+                  err: err instanceof Error ? err.message : String(err),
+                },
+              );
+              ackUuids.push(env.envelopeUuid);
+            } else {
+              this.log.debug("delivery: drain envelope failed transiently — will retry", {
+                envelopeUuid: env.envelopeUuid,
+                err: err instanceof Error ? err.message : String(err),
+              });
+            }
           }
         }
         if (ackUuids.length === 0) return;

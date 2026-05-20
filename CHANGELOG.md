@@ -13,6 +13,49 @@ control — there is no broad-deployment compat negotiation.
 
 ---
 
+## [0.13.2] — 2026-05-20
+
+### Fixed
+
+- **Permanently undecryptable envelopes stuck in `/envelopes/pending`
+  forever**. When the recipient's IndexedDB / scoped KV is wiped
+  (manual clear, profile reset, OS storage eviction), the local Olm
+  Account is gone — but the backend still has OTKs the sender will
+  claim. The sender's prekey-message references an OTK whose private
+  key no longer exists on the recipient. Decrypt fails with
+  vodozemac's "unknown one-time key" error. Pre-0.13.2, those
+  envelopes stayed in the backend's pending queue forever; every
+  reconnect drained them, failed to decrypt, and produced log spam.
+
+  `drainPending` now distinguishes between terminal and transient
+  decrypt failures:
+    - Match on the substring "unknown one-time key" (case-insensitive)
+      → the envelope is permanently unrecoverable on this device.
+      HTTP-ack to clear from the backend queue. The message is lost
+      (no key material exists to decrypt it), but the queue moves
+      forward.
+    - Any other error → keep the existing "leave on queue, retry next
+      reconnect" behavior. Those can recover via the SDK's existing
+      decrypt-failure recovery path (forgetPeerDevice + refresh +
+      retry).
+
+  Log line emitted (visible at `warn` level and above, or in the
+  ring buffer regardless of level):
+  ```
+  [sdk] delivery: envelope permanently undecryptable (unknown OTK), acking to clear queue
+  ```
+
+### Scope note
+
+Only "unknown one-time key" is treated as terminal. Other
+structurally-unrecoverable errors ("no session for normal-type
+ciphertext", certain MAC failures) are still retried indefinitely
+for now. If those start showing up in production logs at meaningful
+rates, the same pattern can be extended — but each addition needs
+its own analysis to avoid acking-away-recoverable envelopes.
+
+---
+
 ## [0.13.1] — 2026-05-20
 
 ### Fixed
@@ -420,6 +463,7 @@ Initial release. Core surface:
   `typing`, `statusChange`, `peerNewDevice`
 - Olm + vodozemac WASM crypto, MMKV / web / memory KV adapters.
 
+[0.13.2]: https://github.com/dTelecom/secure-chat-client/releases/tag/v0.13.2
 [0.13.1]: https://github.com/dTelecom/secure-chat-client/releases/tag/v0.13.1
 [0.13.0]: https://github.com/dTelecom/secure-chat-client/releases/tag/v0.13.0
 [0.12.1]: https://github.com/dTelecom/secure-chat-client/releases/tag/v0.12.1
