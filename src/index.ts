@@ -225,17 +225,26 @@ export interface ConversationsChangedEvt {
 }
 
 /**
- * Fired exactly once per outbound message when the SDK gives up retrying.
- * The stored row's `status` is also written to `"failed"` so the UI can
- * render a "failed" indicator after reload. Apps can show a "retry" button
- * — the right way to retry is to call `chat.sendText(...)` with the same
- * text again; this creates a new `messageId` (the failed one stays in
- * history with `status: "failed"` and the user can delete it locally).
+ * Fired exactly once per outbound message when the SDK gives up. The
+ * stored row's `status` is also written to `"failed"` so the UI can
+ * render a "failed" indicator after reload. Apps can show a "retry"
+ * button — the right way to retry is to call `chat.sendText(...)` with
+ * the same text again; this creates a new `messageId` (the failed one
+ * stays in history with `status: "failed"` and the user can delete it
+ * locally).
+ *
+ * Reasons:
+ *  - `"max_attempts_exceeded"`: the outbox exhausted its retry budget
+ *    for this message (e.g., the WebSocket was never able to deliver
+ *    the bytes to the node).
+ *  - `"server_rejected"`: the node returned `chatSendResult.status =
+ *    "error"` for every per-target envelope of this message. None of
+ *    the recipient's devices received the send. *(added 0.13.3)*
  */
 export interface MessageSendFailedEvt {
   peerUserId: string;
   messageId: string;
-  reason: "max_attempts_exceeded";
+  reason: "max_attempts_exceeded" | "server_rejected";
 }
 
 /**
@@ -1269,6 +1278,21 @@ export class DTelecomSecureChat {
         }
       })();
       this.dispatch("statusChange", { peerUserId, messageId, status });
+      // 0.13.3: when StatusTracker downgrades to "failed" via the
+      // all-targets-error path in onSendResult, surface the same
+      // messageSendFailed event the outbox-max-retries path fires.
+      // Reason distinguishes the two so UI / telemetry can react. The
+      // outbox-max-retries path fires its own messageSendFailed via
+      // onTerminalFailure (see Outbox construction above) and that
+      // path doesn't go through the StatusTracker downgrade — so we
+      // won't double-fire here.
+      if (status === "failed") {
+        this.dispatch("messageSendFailed", {
+          peerUserId,
+          messageId,
+          reason: "server_rejected",
+        });
+      }
     });
 
     this.typingMgr = new TypingManager((peerUserId, state) => {
@@ -2220,8 +2244,22 @@ export class DTelecomSecureChat {
           // Synthesize "stored" so the outbox treats this as a successful
           // attempt and removes the entry. The real per-target outcome
           // arrives separately as a chatSendResult frame (consumed by
-          // StatusTracker). Outbox only cares "did the send go out at all".
+          // StatusTracker — but only relevant for the error-downgrade
+          // path now, since we pre-promote below).
           for (const t of targets) outcomes.set(t.envelopeUuid, "stored");
+          // 0.13.3: promote StatusTracker to "sent" RIGHT NOW, without
+          // waiting for the node's chatSendResult to come back. The
+          // node's wait-for-ack flow can delay chatSendResult by ~2s
+          // when the recipient is offline, producing a "sent" UI
+          // indicator that's invisibly behind. The optimistic
+          // promotion here matches user expectation. If the node
+          // later reports per-target errors, onSendResult downgrades
+          // to "failed".
+          if (event.type === "text" || event.type === "edit" || event.type === "delete") {
+            for (const t of targets) {
+              this.status.onSendResult(t.envelopeUuid, "stored");
+            }
+          }
         } catch {
           for (const t of targets) outcomes.set(t.envelopeUuid, "error");
         }

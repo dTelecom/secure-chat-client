@@ -13,6 +13,58 @@ control — there is no broad-deployment compat negotiation.
 
 ---
 
+## [0.13.3] — 2026-05-20
+
+### Fixed
+
+- **Slow "sent" indicator when recipient is offline**. The sender's
+  per-message status was bumped from `"pending"` → `"sent"` only when
+  the node's `chatSendResult` frame arrived. The node's at-least-once
+  flow waits for a client-device ack with a 2s deadline, so for an
+  offline recipient the sender's UI showed ⏳ for ~2 seconds before
+  flipping to ✓. The status is now promoted **immediately** when
+  `ws.sendChat` returns successfully inside the outbox attempt — no
+  wait. Restores the fast-feedback UX that existed pre-0.11.0,
+  without rolling back the at-least-once delivery guarantees.
+
+  The honest meaning of `"sent"` shifts slightly: it now means
+  "bytes left this SDK without throwing" rather than "node confirmed
+  acceptance." In practice these are nearly identical — a successful
+  `ws.send()` call has written to the TCP socket buffer. The later
+  `chatSendResult` still arrives (10-100ms online, ~2s offline) and
+  is used to detect and propagate genuine server-side failures (see
+  next item).
+
+### Added
+
+- **`messageSendFailed` with `reason: "server_rejected"`**. When the
+  node returns `chatSendResult.status: "error"` for EVERY per-target
+  envelope of a message (none of the recipient's devices accepted
+  the send), the sender's status downgrades from `"sent"` →
+  `"failed"` and `messageSendFailed` fires with the new reason. The
+  downgrade is gated on `status` being one of `"pending"` /
+  `"sent"` — if the message already moved further along the ladder
+  (`"delivered"` / `"read"`), a late error frame for one stale
+  target is ignored. Partial errors with at least one successful
+  target stay at `"sent"`.
+
+  The existing `reason: "max_attempts_exceeded"` (outbox gave up
+  retrying) is unchanged. UI consumers that branch on the reason
+  field should add a case for `"server_rejected"`; consumers that
+  treat any `messageSendFailed` event the same way need no change.
+
+### Compatibility
+
+SDK-only, no node or wire-protocol change.
+
+`MessageSendFailedEvt.reason` adds a new literal-union variant. This
+is type-additive: existing exhaustive `switch (reason)` consumers
+will warn on the new variant but still function (default cases keep
+working). No breaking change for consumers using `instanceof
+ChatError` patterns.
+
+---
+
 ## [0.13.2] — 2026-05-20
 
 ### Fixed
@@ -463,6 +515,7 @@ Initial release. Core surface:
   `typing`, `statusChange`, `peerNewDevice`
 - Olm + vodozemac WASM crypto, MMKV / web / memory KV adapters.
 
+[0.13.3]: https://github.com/dTelecom/secure-chat-client/releases/tag/v0.13.3
 [0.13.2]: https://github.com/dTelecom/secure-chat-client/releases/tag/v0.13.2
 [0.13.1]: https://github.com/dTelecom/secure-chat-client/releases/tag/v0.13.1
 [0.13.0]: https://github.com/dTelecom/secure-chat-client/releases/tag/v0.13.0

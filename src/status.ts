@@ -31,6 +31,14 @@ interface Outbound {
   peerDevices: Set<string>;
   /** Peer device ids that have returned a `received` for this message. */
   receivedFrom: Set<string>;
+  /** Total number of per-target envelopes the SDK shipped. Captured at
+   *  trackOutbound time; used to detect "every target errored" so we can
+   *  downgrade to "failed" without acking-away partial successes. */
+  totalEnvelopes: number;
+  /** envelopeUuids whose chatSendResult returned "error". When this set's
+   *  size === totalEnvelopes the whole message has been rejected by the
+   *  node for every target and downgrades to "failed". */
+  erroredEnvelopes: Set<string>;
   status: MessageStatus;
 }
 
@@ -75,6 +83,8 @@ export class StatusTracker {
       envelopeToDevice: opts.envelopeToDevice,
       peerDevices,
       receivedFrom: new Set(),
+      totalEnvelopes: opts.envelopeToDevice.size,
+      erroredEnvelopes: new Set(),
       status: "pending",
     });
     for (const uuid of opts.envelopeToDevice.keys()) {
@@ -88,7 +98,10 @@ export class StatusTracker {
   /**
    * Process a chatSendResult outcome. Multiple outcomes per message (one
    * per target). Marks the message at least "sent" once any target
-   * succeeds.
+   * succeeds. ALL targets returning "error" → downgrade to "failed",
+   * but only from "pending" / "sent" — once any target has delivered
+   * or read on the recipient side, the message clearly landed and a
+   * late error frame for another target shouldn't roll the status back.
    */
   onSendResult(envelopeUuid: string, status: "live" | "stored" | "dropped" | "error"): void {
     const messageId = this.envelopeToMessage.get(envelopeUuid);
@@ -97,8 +110,26 @@ export class StatusTracker {
     if (!outbound) return;
     if (status === "live" || status === "stored") {
       this.bump(outbound, "sent");
+      return;
     }
-    // dropped/error: leave status alone — caller might retry from the outbox.
+    if (status === "error") {
+      outbound.erroredEnvelopes.add(envelopeUuid);
+      const everyTargetErrored =
+        outbound.erroredEnvelopes.size >= outbound.totalEnvelopes &&
+        outbound.totalEnvelopes > 0;
+      if (!everyTargetErrored) return;
+      // All targets rejected by the node. Only downgrade from a
+      // pre-delivery state — if the receiver side already moved the
+      // status forward via a `received` / `read` event, the message
+      // clearly landed for at least one device and the late "error"
+      // is irrelevant to overall outcome.
+      if (outbound.status === "pending" || outbound.status === "sent") {
+        this.forceSet(outbound, "failed");
+      }
+      return;
+    }
+    // dropped: ephemeral envelope dropped on no-ack — does not apply
+    // to non-ephemeral status tracking. No-op.
   }
 
   /**
@@ -153,9 +184,27 @@ export class StatusTracker {
   private bump(outbound: Outbound, candidate: MessageStatus): void {
     if (rank(candidate) <= rank(outbound.status)) return;
     outbound.status = candidate;
+    this.emit(outbound);
+  }
+
+  /**
+   * Bypass-rank setter for the error-downgrade path. Used only from
+   * onSendResult when every target's chatSendResult returned "error" —
+   * the message is genuinely failed and the status must move backwards
+   * along the ladder from "sent" to "failed". `bump` would silently
+   * no-op because `rank("failed") > rank("sent")` numerically but the
+   * direction conceptually downgrades from a delivery-attempting state.
+   */
+  private forceSet(outbound: Outbound, to: MessageStatus): void {
+    if (outbound.status === to) return;
+    outbound.status = to;
+    this.emit(outbound);
+  }
+
+  private emit(outbound: Outbound): void {
     for (const fn of this.listeners) {
       try {
-        fn(outbound.messageId, candidate, outbound.peerUserId);
+        fn(outbound.messageId, outbound.status, outbound.peerUserId);
       } catch {
         // Listener errors must not break the tracker.
       }

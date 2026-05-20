@@ -96,6 +96,110 @@ describe("StatusTracker", () => {
     tracker.onReceived({ peerUserId: "bob", peerDeviceId: "x", messageIds: ["m-nope"] });
     expect(transitions).toEqual([]);
   });
+
+  // ── 0.13.3 — error → failed downgrade (when every target errors) ──────
+
+  it("single target onSendResult('error') downgrades pending → failed", () => {
+    const { tracker, transitions } = setup();
+    tracker.trackOutbound({
+      messageId: "m1",
+      peerUserId: "bob",
+      envelopeToDevice: new Map([["e1", "bob-only-device"]]),
+    });
+    tracker.onSendResult("e1", "error");
+    expect(tracker.getStatus("m1")).toBe("failed");
+    expect(transitions).toEqual([{ id: "m1", status: "failed", peer: "bob" }]);
+  });
+
+  it("single target onSendResult('error') downgrades sent → failed (Option A optimistic-promote case)", () => {
+    const { tracker, transitions } = setup();
+    tracker.trackOutbound({
+      messageId: "m1",
+      peerUserId: "bob",
+      envelopeToDevice: new Map([["e1", "bob-only-device"]]),
+    });
+    // Simulate the new 0.13.3 outbox path: locally promote to "sent"
+    // before any chatSendResult arrives.
+    tracker.onSendResult("e1", "stored");
+    expect(tracker.getStatus("m1")).toBe("sent");
+    // Now the real chatSendResult comes back with error.
+    tracker.onSendResult("e1", "error");
+    expect(tracker.getStatus("m1")).toBe("failed");
+    expect(transitions.map((t) => t.status)).toEqual(["sent", "failed"]);
+  });
+
+  it("multi-target: partial errors with one success stays at 'sent'", () => {
+    const { tracker } = setup();
+    tracker.trackOutbound({
+      messageId: "m1",
+      peerUserId: "bob",
+      envelopeToDevice: new Map([
+        ["e-phone", "bob-phone"],
+        ["e-laptop", "bob-laptop"],
+      ]),
+    });
+    tracker.onSendResult("e-phone", "live");
+    expect(tracker.getStatus("m1")).toBe("sent");
+    tracker.onSendResult("e-laptop", "error");
+    // One target errored, the other succeeded — message did reach a
+    // device of bob. Don't downgrade.
+    expect(tracker.getStatus("m1")).toBe("sent");
+  });
+
+  it("multi-target: ALL targets erroring downgrades to failed", () => {
+    const { tracker, transitions } = setup();
+    tracker.trackOutbound({
+      messageId: "m1",
+      peerUserId: "bob",
+      envelopeToDevice: new Map([
+        ["e-phone", "bob-phone"],
+        ["e-laptop", "bob-laptop"],
+      ]),
+    });
+    // 0.13.3 optimistic promotion (both targets pre-promoted "stored"
+    // locally before any wire response).
+    tracker.onSendResult("e-phone", "stored");
+    tracker.onSendResult("e-laptop", "stored");
+    expect(tracker.getStatus("m1")).toBe("sent");
+    // Server returns errors for both.
+    tracker.onSendResult("e-phone", "error");
+    expect(tracker.getStatus("m1")).toBe("sent"); // only 1/2 errored
+    tracker.onSendResult("e-laptop", "error");
+    expect(tracker.getStatus("m1")).toBe("failed"); // 2/2 errored
+    const lastTransitions = transitions.map((t) => t.status);
+    expect(lastTransitions[lastTransitions.length - 1]).toBe("failed");
+  });
+
+  it("post-delivery error frames don't downgrade — receiver already saw the message", () => {
+    const { tracker } = setup();
+    tracker.trackOutbound({
+      messageId: "m1",
+      peerUserId: "bob",
+      envelopeToDevice: new Map([
+        ["e-phone", "bob-phone"],
+        ["e-laptop", "bob-laptop"],
+      ]),
+    });
+    // bob-phone delivered, then bob-laptop errors. Status stays.
+    tracker.onSendResult("e-phone", "live");
+    tracker.onReceived({ peerUserId: "bob", peerDeviceId: "bob-phone", messageIds: ["m1"] });
+    expect(tracker.getStatus("m1")).toBe("delivered");
+    // Late error for the other target.
+    tracker.onSendResult("e-laptop", "error");
+    expect(tracker.getStatus("m1")).toBe("delivered"); // NOT downgraded
+  });
+
+  it("'dropped' status is still a no-op (ephemeral)", () => {
+    const { tracker, transitions } = setup();
+    tracker.trackOutbound({
+      messageId: "m1",
+      peerUserId: "bob",
+      envelopeToDevice: new Map([["e1", "bob-phone"]]),
+    });
+    tracker.onSendResult("e1", "dropped");
+    expect(tracker.getStatus("m1")).toBe("pending");
+    expect(transitions).toEqual([]);
+  });
 });
 
 // ── MessageStore ────────────────────────────────────────────────────────────
