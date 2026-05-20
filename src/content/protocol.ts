@@ -11,6 +11,18 @@ import { generateUUID } from "../device.js";
 
 export const CONTENT_PROTOCOL_VERSION = 1;
 
+/**
+ * Time window after a message's `sentAt` during which the original sender
+ * may edit it. Beyond this the SDK rejects `editMessage` with
+ * `ChatError("edit_window_expired")`, and receivers drop inbound edit
+ * events whose `editEvent.clientSentAt - target.sentAt` exceeds this
+ * value. 24h matches the WhatsApp / Telegram / Signal convention.
+ *
+ * Exposed so apps can compare against their own UI deadlines (e.g.,
+ * disable the "edit" affordance once the window has passed).
+ */
+export const EDIT_WINDOW_MS = 24 * 60 * 60 * 1000;
+
 /** Common header on every content event. */
 interface BaseEvent {
   v: 1;
@@ -62,13 +74,54 @@ export interface TypingEvent extends BaseEvent {
   state: "started" | "stopped";
 }
 
+/**
+ * "Delete this whole thread on every device of MINE." Self-echo-only —
+ * the peer never sees this. The receiver (a sibling device of the same
+ * user) clears local history + the conversation row for `peerUserId`.
+ * UI: the chat disappears from the list on every device of the user.
+ *
+ * Future messages between this user and `peerUserId` start fresh; the
+ * Olm session is untouched.
+ */
+export interface ChatDeleteSelfEvent extends BaseEvent {
+  type: "chatDeleteSelf";
+  /** Thread to wipe on the receiver (a sibling of the sender). */
+  peerUserId: string;
+}
+
+/**
+ * "Delete this whole thread on every device of EVERY participant." Sent
+ * to the peer via normal fanout AND self-echoed to the sender's
+ * siblings. The receiver (peer's device OR sender's sibling) wipes
+ * local history for the implied thread.
+ *
+ * No `peerUserId` field — the thread is implicit (whichever Olm-bound
+ * pair the event arrived on). For sender's-sibling self-echo we
+ * unwrap via the SelfEchoEvent.originalPeer field.
+ *
+ * One-shot semantics: receivers track a per-peer delete-watermark and
+ * drop any `chatDeleteAll` whose `clientSentAt` is ≤ the watermark.
+ * Sending a fresh text bumps the watermark, so a replayed stale event
+ * after the chat is re-engaged cannot retroactively wipe the new
+ * conversation.
+ */
+export interface ChatDeleteAllEvent extends BaseEvent {
+  type: "chatDeleteAll";
+}
+
 /** Multi-device self-echo (Signal "sync messages"). Sent by the originator
  *  to its own user (filtered: not back to the sender's own device) so the
  *  user's other devices observe outbound traffic from this device. The
  *  receiver validates `peerUserId === selfUserId` before unwrapping —
  *  the Olm session binding means only this user's authentic devices can
  *  produce a ciphertext that decrypts under our self-keyed inbound state. */
-export type SelfEchoableEvent = TextEvent | EditEvent | DeleteEvent | ReadEvent;
+export type SelfEchoableEvent =
+  | TextEvent
+  | EditEvent
+  | DeleteEvent
+  | ReadEvent
+  | ChatDeleteSelfEvent
+  | ChatDeleteAllEvent;
 export interface SelfEchoEvent extends BaseEvent {
   type: "selfEcho";
   originalPeer: string;
@@ -82,7 +135,9 @@ export type ContentEvent =
   | ReadEvent
   | ReceivedEvent
   | TypingEvent
-  | SelfEchoEvent;
+  | SelfEchoEvent
+  | ChatDeleteSelfEvent
+  | ChatDeleteAllEvent;
 
 export type ContentEventType = ContentEvent["type"];
 
@@ -198,7 +253,8 @@ export function decodeEvent(plaintext: string): ContentEvent | null {
       const inner = decodeEvent(JSON.stringify(obj.original));
       if (inner === null) return null;
       if (inner.type !== "text" && inner.type !== "edit" &&
-          inner.type !== "delete" && inner.type !== "read") {
+          inner.type !== "delete" && inner.type !== "read" &&
+          inner.type !== "chatDeleteSelf" && inner.type !== "chatDeleteAll") {
         return null;
       }
       return {
@@ -208,6 +264,24 @@ export function decodeEvent(plaintext: string): ContentEvent | null {
         clientSentAt: obj.clientSentAt,
         originalPeer: obj.originalPeer,
         original: inner,
+      };
+    }
+    case "chatDeleteSelf": {
+      if (typeof obj.peerUserId !== "string" || !obj.peerUserId) return null;
+      return {
+        v: 1,
+        id: obj.id,
+        type: "chatDeleteSelf",
+        clientSentAt: obj.clientSentAt,
+        peerUserId: obj.peerUserId,
+      };
+    }
+    case "chatDeleteAll": {
+      return {
+        v: 1,
+        id: obj.id,
+        type: "chatDeleteAll",
+        clientSentAt: obj.clientSentAt,
       };
     }
     default:
@@ -262,6 +336,14 @@ export function newReceived(ids: string[]): ReceivedEvent {
 
 export function newTyping(state: "started" | "stopped"): TypingEvent {
   return { v: 1, id: newId(), type: "typing", clientSentAt: Date.now(), state };
+}
+
+export function newChatDeleteSelf(peerUserId: string): ChatDeleteSelfEvent {
+  return { v: 1, id: newId(), type: "chatDeleteSelf", clientSentAt: Date.now(), peerUserId };
+}
+
+export function newChatDeleteAll(): ChatDeleteAllEvent {
+  return { v: 1, id: newId(), type: "chatDeleteAll", clientSentAt: Date.now() };
 }
 
 export function newSelfEcho(originalPeer: string, original: SelfEchoableEvent): SelfEchoEvent {

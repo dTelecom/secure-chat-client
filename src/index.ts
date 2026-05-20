@@ -1,10 +1,12 @@
 // Public SDK surface. Wires transport + crypto + content protocol behind
 // a small event-emitter API. Most app code will only ever touch this file.
 
-import { CONTENT_PROTOCOL_VERSION as _CONTENT_VERSION } from "./content/protocol.js";
+import { CONTENT_PROTOCOL_VERSION as _CONTENT_VERSION, EDIT_WINDOW_MS } from "./content/protocol.js";
 import {
   decodeEventBytes,
   encodeEventBytes,
+  newChatDeleteAll,
+  newChatDeleteSelf,
   newDelete,
   newEdit,
   newRead,
@@ -15,6 +17,7 @@ import {
   type SelfEchoableEvent,
   type ContentEvent,
 } from "./content/protocol.js";
+export { EDIT_WINDOW_MS } from "./content/protocol.js";
 import type { CryptoAdapter } from "./crypto/interface.js";
 import { OlmCryptoAdapter } from "./crypto/olm-adapter.js";
 import { generateUUID, loadOrCreateDeviceId } from "./device.js";
@@ -227,6 +230,13 @@ export interface TabConflictEvt {
  * - `offline` — the underlying `fetch` threw (no network reachable).
  * - `rate_limited` — backend returned 429. `err.status === 429`.
  * - `server_error` — backend returned 5xx. `err.status` carries the code.
+ * - `edit_window_expired` — `editMessage` called on a message older than
+ *   `EDIT_WINDOW_MS` (default 24h). The original message is unchanged.
+ * - `not_found` — the message id passed to `editMessage` / `deleteMessage`
+ *   isn't in the local store. Usually a UI bug.
+ * - `not_authorized` — caller tried to edit/delete a message they didn't
+ *   author. The Olm-session-bound receiver check would also reject this,
+ *   but the SDK catches it earlier so no wire send happens.
  * - `internal` — SDK-side bug, crypto failure, malformed state, etc.
  *   Usually means a code path needs investigation; safe to surface as a
  *   generic "Something went wrong" toast.
@@ -237,6 +247,9 @@ export type ChatErrorCode =
   | "offline"
   | "rate_limited"
   | "server_error"
+  | "edit_window_expired"
+  | "not_found"
+  | "not_authorized"
   | "internal";
 
 /**
@@ -310,6 +323,27 @@ export interface ConnectionStateChangedEvt {
   state: ConnectionState;
 }
 
+/**
+ * Fired on this device (and on siblings of this user) when the local user
+ * deleted the conversation. `scope === "me"` means delete-for-self (peer
+ * keeps the thread); `scope === "everyone"` means delete-for-all (peer's
+ * devices also wiped).
+ */
+export interface ConversationDeletedBySelfEvt {
+  peerUserId: string;
+  scope: "me" | "everyone";
+}
+
+/**
+ * Fired when a peer wiped this thread via `deleteConversationForEveryone`.
+ * The SDK has already cleared local history + the conversation row by
+ * the time this dispatches. UI should hide the chat from the list and
+ * optionally toast.
+ */
+export interface ConversationDeletedByPeerEvt {
+  peerUserId: string;
+}
+
 interface EventMap {
   message: MessageReceived;
   messageEdited: MessageEdited;
@@ -319,6 +353,8 @@ interface EventMap {
   statusChange: StatusChangeEvt;
   peerNewDevice: PeerNewDeviceEvt;
   conversationsChanged: ConversationsChangedEvt;
+  conversationDeletedBySelf: ConversationDeletedBySelfEvt;
+  conversationDeletedByPeer: ConversationDeletedByPeerEvt;
   connectionStateChange: ConnectionStateChangedEvt;
   messageSendFailed: MessageSendFailedEvt;
   tabConflict: TabConflictEvt;
@@ -540,6 +576,16 @@ export class DTelecomSecureChat {
 
   async sendText(peerUserId: string, text: string, opts?: { replyTo?: string }): Promise<string> {
     const event = newText(text, opts?.replyTo);
+    // Re-engagement: if this peer's delete-watermark is non-zero, the
+    // user (or the peer) previously wiped this conversation. Sending
+    // fresh text recreates the chat; bump the watermark to NOW so any
+    // stale delete-all event still flying in the at-least-once layer
+    // can't retroactively kill the new conversation. See
+    // `chatDeleteAll` receive case for the matching check.
+    const existingWatermark = await this.messages.getDeleteWatermark(peerUserId);
+    if (existingWatermark > 0) {
+      await this.messages.setDeleteWatermark(peerUserId, event.clientSentAt);
+    }
     await this.sendContent(peerUserId, event, { ephemeral: false });
 
     // Persist locally so the UI can show our own sent message.
@@ -630,7 +676,34 @@ export class DTelecomSecureChat {
     await this.selfEcho(msg.peerUserId, event);
   }
 
+  /**
+   * Edit one of YOUR previously-sent messages within the
+   * `EDIT_WINDOW_MS` window (default 24h). Receivers enforce the same
+   * window, so a clock-skewed sender can't sneak an out-of-window edit
+   * through.
+   *
+   * Throws `ChatError("not_found")` if the local store doesn't have
+   * `targetId`. Throws `ChatError("not_authorized")` if you didn't
+   * author the original. Throws `ChatError("edit_window_expired")` if
+   * the message is older than `EDIT_WINDOW_MS`.
+   */
   async editMessage(peerUserId: string, targetId: string, newText: string): Promise<string> {
+    // Sender-side validation up front so we don't fire a doomed wire
+    // send. The receiver enforces the same rules, but failing fast here
+    // gives the UI a clean exception and avoids burning OTKs.
+    const original = await this.messages.get(targetId);
+    if (!original) {
+      throw new ChatError("not_found", `message ${targetId} not in local store`);
+    }
+    if (this.selfUserId === null || original.senderUserId !== this.selfUserId) {
+      throw new ChatError("not_authorized", "cannot edit a message you didn't send");
+    }
+    if (Date.now() - original.sentAt > EDIT_WINDOW_MS) {
+      throw new ChatError(
+        "edit_window_expired",
+        `message ${targetId} is older than the ${EDIT_WINDOW_MS}ms edit window`,
+      );
+    }
     const event = newEdit(targetId, newText);
     await this.sendContent(peerUserId, event, { ephemeral: false });
     if (this.selfUserId) {
@@ -639,13 +712,33 @@ export class DTelecomSecureChat {
         editorUserId: this.selfUserId,
         newText,
         editedAt: event.clientSentAt,
+        originalSentAt: original.sentAt,
       });
     }
     await this.selfEcho(peerUserId, event);
     return event.id;
   }
 
+  /**
+   * Delete (tombstone) one of YOUR previously-sent messages. The `text`
+   * is wiped, `deletedAt` is set. Receivers see the same tombstone via
+   * their `messageDeleted` event. UI: render "this message was deleted"
+   * when `deletedAt !== null`. No time-window restriction.
+   *
+   * Throws `ChatError("not_found")` if the local store doesn't have
+   * `targetId`. Throws `ChatError("not_authorized")` if you didn't
+   * author the original (the receiver-side check would also reject this,
+   * but failing fast here avoids burning OTKs and gives the UI a clean
+   * exception).
+   */
   async deleteMessage(peerUserId: string, targetId: string): Promise<string> {
+    const original = await this.messages.get(targetId);
+    if (!original) {
+      throw new ChatError("not_found", `message ${targetId} not in local store`);
+    }
+    if (this.selfUserId === null || original.senderUserId !== this.selfUserId) {
+      throw new ChatError("not_authorized", "cannot delete a message you didn't send");
+    }
     const event = newDelete(targetId);
     await this.sendContent(peerUserId, event, { ephemeral: false });
     if (this.selfUserId) {
@@ -806,11 +899,86 @@ export class DTelecomSecureChat {
 
   // ── public API: thread housekeeping ────────────────────────────────────────
 
-  /** Remove all locally-stored state for a 1:1 thread: messages + conversation
-   *  index row. The Olm session is NOT torn down — future messages from this
-   *  peer will still arrive over the existing session and surface as new
-   *  conversation activity. Use this for "remove from list" UX. To stop
-   *  receiving altogether, the host's block UI is the right primitive. */
+  /**
+   * Delete the thread on EVERY device of YOUR user (multi-device). Wipes
+   * local messages + the conversation index row, advances the per-peer
+   * delete-watermark to now, and self-echoes a `chatDeleteSelf` to your
+   * siblings so they wipe too.
+   *
+   * The peer is NOT signaled — they still have the thread on their side
+   * and can keep sending. Future inbound messages re-create the
+   * conversation. Olm sessions are untouched.
+   *
+   * Use case: "remove this chat from my list, on all my devices."
+   *
+   * Throws nothing for a thread that doesn't exist (idempotent).
+   */
+  async deleteConversationForMe(peerUserId: string): Promise<void> {
+    await this.messages.deleteForPeer(peerUserId);
+    await this.conversations.delete(peerUserId);
+    // Bump the watermark so a delete-for-everyone from the peer in flight
+    // at the moment we recreate the conversation can't retroactively
+    // re-wipe it. (For symmetry with the everyone-delete path.)
+    await this.messages.setDeleteWatermark(peerUserId, Date.now());
+    if (this.selfUserId) {
+      const event = newChatDeleteSelf(peerUserId);
+      await this.selfEcho(peerUserId, event);
+    }
+    await this.emitConversationsChanged([peerUserId]);
+    this.dispatch("conversationDeletedBySelf", { peerUserId, scope: "me" });
+  }
+
+  /**
+   * Delete the thread on EVERY device of EVERY participant — yours and
+   * the peer's. Sends a `chatDeleteAll` content event to the peer
+   * (their devices wipe + the chat disappears from their list and
+   * fires `conversationDeletedByPeer` for their UI). Self-echoes to
+   * your siblings so they wipe too.
+   *
+   * One-shot semantics: receivers track a per-peer delete-watermark
+   * and drop any delete-all event whose `clientSentAt` is ≤ the
+   * watermark. The first outbound text after a delete-all bumps the
+   * watermark to "now", so a stale delete-all replayed from offline
+   * storage cannot retroactively kill a re-engaged conversation.
+   *
+   * Olm sessions survive — if either side sends to the other later,
+   * the conversation re-creates from scratch.
+   *
+   * Throws `ChatError("peer_unreachable")` if the peer has no
+   * registered devices (same shape as a `sendText` to an unreachable
+   * peer). Local state is wiped regardless — the at-least-once
+   * delivery layer will eventually land the event on the peer if/when
+   * they come back online.
+   */
+  async deleteConversationForEveryone(peerUserId: string): Promise<void> {
+    const event = newChatDeleteAll();
+    // Wipe local FIRST so the UI is responsive even if the wire send
+    // takes a moment. At-least-once delivery handles eventual landing
+    // on the peer.
+    await this.messages.deleteForPeer(peerUserId);
+    await this.conversations.delete(peerUserId);
+    await this.messages.setDeleteWatermark(peerUserId, event.clientSentAt);
+    await this.emitConversationsChanged([peerUserId]);
+    this.dispatch("conversationDeletedBySelf", { peerUserId, scope: "everyone" });
+    // Send to peer. Self-echo to siblings (they wipe via the
+    // "chatDeleteAll" inner case in the selfEcho switch).
+    try {
+      await this.sendContent(peerUserId, event, { ephemeral: false });
+    } finally {
+      // Best-effort: even if the peer send threw (peer_unreachable),
+      // siblings should still wipe. They'll receive via self-echo
+      // (which uses a separate fanout to selfUserId).
+      await this.selfEcho(peerUserId, event);
+    }
+  }
+
+  /**
+   * @deprecated since 0.12.0 — use {@link deleteConversationForMe} for
+   * multi-device-consistent local wipe, or
+   * {@link deleteConversationForEveryone} to also wipe the peer's side.
+   * This method only clears the device it's called on; siblings remain
+   * out of sync. Will be removed in a future version.
+   */
   async deleteConversation(peerUserId: string): Promise<void> {
     await this.messages.deleteForPeer(peerUserId);
     await this.conversations.delete(peerUserId);
@@ -1443,6 +1611,15 @@ export class DTelecomSecureChat {
 
     switch (event.type) {
       case "text": {
+        // Re-engagement (inbound side): if the peer is sending us text,
+        // they have the conversation. Any earlier delete-all from them
+        // still flying in the at-least-once layer must be stale — bump
+        // the watermark to this text's clientSentAt so the delete-all
+        // is dropped on arrival.
+        const existingWatermark = await this.messages.getDeleteWatermark(peerUserId);
+        if (existingWatermark > 0 && event.clientSentAt > existingWatermark) {
+          await this.messages.setDeleteWatermark(peerUserId, event.clientSentAt);
+        }
         await this.messages.put({
           id: event.id,
           peerUserId,
@@ -1520,6 +1697,36 @@ export class DTelecomSecureChat {
       }
       case "typing": {
         this.dispatch("typing", { peerUserId, peerDeviceId, state: event.state });
+        return;
+      }
+      case "chatDeleteSelf": {
+        // Peer-authored chatDeleteSelf shouldn't reach a peer's device
+        // — by design these events are self-echo-only. If somehow one
+        // arrives over a peer Olm session, drop it (the wire layer
+        // can't enforce semantics, only the SDK can). Dispatching it
+        // here would let a peer wipe the local user's other threads,
+        // which is not the contract.
+        return;
+      }
+      case "chatDeleteAll": {
+        // One-shot guard: ignore if the event predates our recorded
+        // watermark for this peer. Sending fresh text bumps the
+        // watermark to "now", so a stale delete-all replayed from
+        // offline storage after the user re-engages cannot retro-wipe
+        // the new conversation.
+        const watermark = await this.messages.getDeleteWatermark(peerUserId);
+        if (event.clientSentAt <= watermark) {
+          // Still ack so the sender's status tracker can promote and
+          // the envelope doesn't sit in /envelopes/pending forever.
+          this.queueReceivedAck(peerUserId, peerDeviceId, event.id);
+          return;
+        }
+        await this.messages.deleteForPeer(peerUserId);
+        await this.conversations.delete(peerUserId);
+        await this.messages.setDeleteWatermark(peerUserId, event.clientSentAt);
+        await this.emitConversationsChanged([peerUserId]);
+        this.dispatch("conversationDeletedByPeer", { peerUserId });
+        this.queueReceivedAck(peerUserId, peerDeviceId, event.id);
         return;
       }
       case "selfEcho": {
@@ -1604,6 +1811,29 @@ export class DTelecomSecureChat {
             // own devices.
             this.status.onRead({ peerUserId: originalPeer, upToId: inner.upToId });
             await this.bumpReadWatermark(originalPeer, inner.upToId);
+            return;
+          }
+          case "chatDeleteSelf": {
+            // A sibling device of ours triggered "delete this chat on
+            // every device of mine." Wipe local + bump the watermark
+            // so we don't accidentally honor a stale delete-all from
+            // the peer after the user recreates the conversation.
+            await this.messages.deleteForPeer(inner.peerUserId);
+            await this.conversations.delete(inner.peerUserId);
+            await this.messages.setDeleteWatermark(inner.peerUserId, inner.clientSentAt);
+            await this.emitConversationsChanged([inner.peerUserId]);
+            this.dispatch("conversationDeletedBySelf", { peerUserId: inner.peerUserId, scope: "me" });
+            return;
+          }
+          case "chatDeleteAll": {
+            // A sibling device of ours sent the delete-for-everyone
+            // event to `originalPeer`. Our local view must match —
+            // wipe + bump watermark.
+            await this.messages.deleteForPeer(originalPeer);
+            await this.conversations.delete(originalPeer);
+            await this.messages.setDeleteWatermark(originalPeer, inner.clientSentAt);
+            await this.emitConversationsChanged([originalPeer]);
+            this.dispatch("conversationDeletedBySelf", { peerUserId: originalPeer, scope: "everyone" });
             return;
           }
         }

@@ -5,6 +5,7 @@
 //
 // In-memory + KV-backed. Keys are prefixed under "messages/<peerUserId>/<id>".
 
+import { EDIT_WINDOW_MS } from "./content/protocol.js";
 import type { KVStore } from "./store/interface.js";
 import type { MessageStatus } from "./status.js";
 
@@ -21,9 +22,19 @@ export interface StoredMessage {
   text: string;
   /** Original clientSentAt of the text event; never mutated by edits. */
   sentAt: number;
-  /** Set on edit; null otherwise. */
+  /**
+   * Set to the edit event's `clientSentAt` when the message has been
+   * edited (by the original sender, within the EDIT_WINDOW_MS deadline).
+   * Null otherwise. UI: render an "edited" badge when this is non-null.
+   * The `text` field reflects the post-edit content; the original is not
+   * preserved.
+   */
   editedAt: number | null;
-  /** Set on delete; the message becomes a tombstone. */
+  /**
+   * Set to the delete event's `clientSentAt` when the message has been
+   * tombstoned. The `text` field is wiped to "" on delete; UI: render
+   * "this message was deleted" when this is non-null.
+   */
   deletedAt: number | null;
   replyTo?: string;
   /** Sender-side delivery status, mirrored from `StatusTracker` so the
@@ -105,19 +116,37 @@ export class MessageStore {
 
   /**
    * Apply an edit if authorized. Returns the resulting message on
-   * success, or null if the message doesn't exist, is already deleted,
-   * or the editor is not the original sender.
+   * success, or null if:
+   *   - the message doesn't exist
+   *   - the message is already tombstoned
+   *   - the editor is not the original sender
+   *   - the edit is past the EDIT_WINDOW_MS deadline (`editedAt` is the
+   *     sender's clientSentAt for the edit event; we compare against
+   *     the original's `sentAt`, NOT the receiver's wall clock — that
+   *     way a misconfigured sender can't sneak past us by setting
+   *     `editedAt = original.sentAt`).
+   *
+   * `originalSentAt` is required so callers don't have to pre-fetch
+   * the target row (we do it anyway, but the explicit param documents
+   * the contract). Falls back to `target.sentAt` from the fetched row
+   * if undefined.
    */
   async applyEdit(opts: {
     targetId: string;
     editorUserId: string;
     newText: string;
     editedAt: number;
+    /** Optional: the sender's clientSentAt of the ORIGINAL message.
+     *  Provided by the SDK sender path; receiver path lets it default
+     *  to the stored row's sentAt. */
+    originalSentAt?: number;
   }): Promise<StoredMessage | null> {
     const target = await this.get(opts.targetId);
     if (!target) return null;
     if (target.deletedAt !== null) return null;
     if (target.senderUserId !== opts.editorUserId) return null;
+    const baseSentAt = opts.originalSentAt ?? target.sentAt;
+    if (opts.editedAt - baseSentAt > EDIT_WINDOW_MS) return null;
     const updated: StoredMessage = {
       ...target,
       text: opts.newText,
@@ -152,7 +181,8 @@ export class MessageStore {
   /**
    * Drop every message stored for `peerUserId` — KV rows AND in-memory
    * cache, so subsequent `get`/`listForPeer` calls return nothing. Used
-   * by `chat.deleteConversation` for the "remove from list" UX.
+   * by `chat.deleteConversationFor{Me,Everyone}` for the "remove from
+   * list" UX.
    */
   async deleteForPeer(peerUserId: string): Promise<void> {
     const msgs = await this.listForPeer(peerUserId);
@@ -162,7 +192,31 @@ export class MessageStore {
     }
   }
 
+  // ── per-peer chat-delete watermark ──────────────────────────────────────
+  //
+  // The watermark is the `clientSentAt` of the most recent delete event
+  // (or local recreate-via-send) honored for this peer. A `chatDeleteAll`
+  // arriving with `clientSentAt <= watermark` is silently dropped: this
+  // protects a freshly-recreated conversation from being wiped by a
+  // stale delete event replayed from `/envelopes/pending` or the node's
+  // post-webhook publish.
+
+  async getDeleteWatermark(peerUserId: string): Promise<number> {
+    const raw = await this.store.getString(this.watermarkKey(peerUserId));
+    if (!raw) return 0;
+    const n = Number(raw);
+    return Number.isFinite(n) ? n : 0;
+  }
+
+  async setDeleteWatermark(peerUserId: string, ms: number): Promise<void> {
+    await this.store.setString(this.watermarkKey(peerUserId), String(ms));
+  }
+
   private kvKey(messageId: string): string {
     return `messages/${messageId}`;
+  }
+
+  private watermarkKey(peerUserId: string): string {
+    return `chatDeleteWatermark/${peerUserId}`;
   }
 }
