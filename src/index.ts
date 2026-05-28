@@ -669,9 +669,16 @@ export class DTelecomSecureChat {
     if (existingWatermark > 0) {
       await this.messages.setDeleteWatermark(peerUserId, event.clientSentAt);
     }
-    await this.sendContent(peerUserId, event, { ephemeral: false });
 
-    // Persist locally so the UI can show our own sent message.
+    // Persist locally BEFORE sendContent. sendContentInner's Option-A
+    // optimistic-promotion path (0.13.3) fires status.onSendResult
+    // synchronously after ws.sendChat — that dispatches the
+    // StatusTracker listener, which calls messages.get(messageId) and
+    // skips the persist if the row doesn't exist yet. Persisting after
+    // sendContent meant the listener silently no-op'd and the
+    // subsequent put({status:"pending"}) locked the row at "pending"
+    // for the lifetime of the install, even though the wire send
+    // succeeded. See test/status-pending-forever.test.ts.
     if (this.selfUserId) {
       await this.messages.put({
         id: event.id,
@@ -690,6 +697,28 @@ export class DTelecomSecureChat {
         messageId: event.id,
         sentAt: event.clientSentAt,
       });
+    }
+
+    try {
+      await this.sendContent(peerUserId, event, { ephemeral: false });
+    } catch (err) {
+      // sendContent threw (peer_unreachable / encryption failure / etc).
+      // The persisted row is at "pending" with no chance of advancing —
+      // mark it "failed" so retrySend can pick it up and the UI can
+      // render a failed indicator. Re-throw so the caller's try/catch
+      // still gets the typed ChatError.
+      if (this.selfUserId) {
+        const msg = await this.messages.get(event.id);
+        if (msg) {
+          await this.messages.put({ ...msg, status: "failed" });
+          this.dispatch("statusChange", {
+            peerUserId,
+            messageId: event.id,
+            status: "failed",
+          });
+        }
+      }
+      throw err;
     }
     await this.selfEcho(peerUserId, event);
     this.typingMgr.clearOnSend(peerUserId);
@@ -849,7 +878,15 @@ export class DTelecomSecureChat {
     await this.bumpReadWatermark(peerUserId, upToMessageId);
     if (!(await this.areReadReceiptsEnabled())) return;
     const event = newRead(upToMessageId);
-    await this.sendContent(peerUserId, event, { ephemeral: false });
+    // ephemeral:true — read receipts are informational state sync.
+    // Going through the durable webhook path would generate a push
+    // notification to the original sender for every "your read indicator
+    // advanced" event, which is noise (the FE re-fires markRead on every
+    // chat mount, including page reload). Lost wire delivery is
+    // self-healing: the next markRead with a higher watermark
+    // re-establishes the sender's UI. See `flushReceivedBatch` for the
+    // same reasoning applied to `received`.
+    await this.sendContent(peerUserId, event, { ephemeral: true });
     await this.selfEcho(peerUserId, event);
   }
 
@@ -2067,7 +2104,15 @@ export class DTelecomSecureChat {
           return;
         }
       }
-      await this.sendContent(this.selfUserId, echo, { ephemeral: false });
+      // Informational sync goes ephemeral so an offline sibling device
+      // doesn't get a push notification for "your read indicator
+      // advanced." Durable user-content events (text/edit/delete/
+      // chatDeleteAll) stay non-ephemeral so siblings drain them on
+      // next reconnect and the local history converges.
+      // (`received` is not in SelfEchoableEvent — siblings independently
+      // fire their own `received` for the messages they receive.)
+      const ephemeral = original.type === "read";
+      await this.sendContent(this.selfUserId, echo, { ephemeral });
     } catch {
       // ignore — peer-side delivery already succeeded; sync convergence
       // gets a second chance on the next send.
@@ -2295,7 +2340,12 @@ export class DTelecomSecureChat {
     if (this.pendingReceived.size === 0) return;
     for (const [key, ids] of this.pendingReceived.entries()) {
       const [peerUserId] = key.split("|");
-      this.sendContent(peerUserId, newReceived(ids), { ephemeral: false }).catch(() => {});
+      // ephemeral:true — `received` is an informational ✓✓ signal back
+      // to the sender. Going through the durable webhook path generates
+      // a push notification for what is purely a delivery confirmation.
+      // Lost wire delivery is self-healing: the next received batch (on
+      // the next inbound from this peer) re-establishes the sender's UI.
+      this.sendContent(peerUserId, newReceived(ids), { ephemeral: true }).catch(() => {});
     }
     this.pendingReceived.clear();
   }

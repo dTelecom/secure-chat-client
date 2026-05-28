@@ -13,6 +13,40 @@ control — there is no broad-deployment compat negotiation.
 
 ---
 
+## [0.13.4] — 2026-05-28
+
+### Fixed
+
+- **Message status stuck at "pending" forever**. `sendText` was awaiting
+  `sendContent` BEFORE calling `messages.put({status:"pending"})`, so the
+  Option-A optimistic-promotion path (added in 0.13.3) fired its
+  StatusTracker listener with the row not yet in the store — the
+  listener silently skipped its persist (the `if (msg && ...)` guard),
+  then `sendText`'s own `put` locked the row at "pending" for the
+  lifetime of the install. The wire send actually succeeded; only the
+  persisted status was wrong, which meant the UI showed `⏳` instead of
+  `✓` after page reload. Fix: persist first, then send. On `sendContent`
+  throw, the row is downgraded to "failed" (with a `statusChange`
+  event) before the error propagates, so `retrySend` can pick it up.
+
+- **Read receipts and delivery acks triggering offline push notifications**.
+  `markRead` and `flushReceivedBatch` were both `ephemeral: false`, so
+  when the original sender was offline the `read` / `received` envelopes
+  went through the webhook fallback and fired `FireChatPushIfNeeded`.
+  Symptom: opening any chat with an offline peer woke them up via push
+  ("You have a new message"), and every page reload re-fired the same
+  push because the FE's `lastMarkedReadRef` resets on mount. The backend
+  has no way to filter by content type — the ciphertext is encrypted —
+  so the SDK has to mark these as ephemeral. Fix: `markRead`,
+  `flushReceivedBatch`, and the `selfEcho` fanout of `read` events all
+  use `ephemeral: true`. With the ephemeral fast-path on the node
+  (livekit/pkg/chat dispatch, 2026-05-26), this means one publish
+  attempt, no retry, no webhook, no push. Lost wire delivery is
+  self-healing: the next `markRead` / received batch re-establishes the
+  sender's UI.
+
+---
+
 ## [0.13.3] — 2026-05-20
 
 ### Fixed
