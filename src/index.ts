@@ -817,7 +817,10 @@ export class DTelecomSecureChat {
       );
     }
     const event = newEdit(targetId, newText);
-    await this.sendContent(peerUserId, event, { ephemeral: false });
+    // Durable wire delivery, but no push: an edit to a message the peer
+    // has already read shouldn't wake them. Their UI updates silently on
+    // next foreground.
+    await this.sendContent(peerUserId, event, { ephemeral: false, notifyPush: false });
     if (this.selfUserId) {
       await this.messages.applyEdit({
         targetId,
@@ -852,7 +855,10 @@ export class DTelecomSecureChat {
       throw new ChatError("not_authorized", "cannot delete a message you didn't send");
     }
     const event = newDelete(targetId);
-    await this.sendContent(peerUserId, event, { ephemeral: false });
+    // Durable wire delivery, but no push: a tombstone shouldn't wake
+    // the peer. Their UI applies the tombstone silently on next
+    // foreground.
+    await this.sendContent(peerUserId, event, { ephemeral: false, notifyPush: false });
     if (this.selfUserId) {
       await this.messages.applyDelete({
         targetId,
@@ -886,7 +892,12 @@ export class DTelecomSecureChat {
     // self-healing: the next markRead with a higher watermark
     // re-establishes the sender's UI. See `flushReceivedBatch` for the
     // same reasoning applied to `received`.
-    await this.sendContent(peerUserId, event, { ephemeral: true });
+    //
+    // notifyPush:false is a belt-and-suspenders. Ephemerals skip the
+    // webhook entirely so push wouldn't fire anyway, but if someone
+    // later changes the ephemeral semantics, the hint preserves the
+    // "no push for read receipts" guarantee.
+    await this.sendContent(peerUserId, event, { ephemeral: true, notifyPush: false });
     await this.selfEcho(peerUserId, event);
   }
 
@@ -1083,7 +1094,9 @@ export class DTelecomSecureChat {
     // Send to peer. Self-echo to siblings (they wipe via the
     // "chatDeleteAll" inner case in the selfEcho switch).
     try {
-      await this.sendContent(peerUserId, event, { ephemeral: false });
+      // notifyPush:false — wiping a conversation shouldn't wake the peer.
+      // Their UI applies the tombstone silently on next foreground.
+      await this.sendContent(peerUserId, event, { ephemeral: false, notifyPush: false });
     } finally {
       // Best-effort: even if the peer send threw (peer_unreachable),
       // siblings should still wipe. They'll receive via self-echo
@@ -1334,7 +1347,9 @@ export class DTelecomSecureChat {
 
     this.typingMgr = new TypingManager((peerUserId, state) => {
       // Fire-and-forget; we don't await typing ephemeral fanout.
-      this.sendContent(peerUserId, newTyping(state), { ephemeral: true }).catch(() => {});
+      // notifyPush:false is a belt-and-suspenders — ephemerals skip
+      // webhook today, so this hint only matters if that ever changes.
+      this.sendContent(peerUserId, newTyping(state), { ephemeral: true, notifyPush: false }).catch(() => {});
     });
 
     // Construct the WS client BUT don't connect it yet — connection is
@@ -2112,7 +2127,11 @@ export class DTelecomSecureChat {
       // (`received` is not in SelfEchoableEvent — siblings independently
       // fire their own `received` for the messages they receive.)
       const ephemeral = original.type === "read";
-      await this.sendContent(this.selfUserId, echo, { ephemeral });
+      // notifyPush:false unconditionally — selfEcho is sibling-device
+      // state sync, never something the user needs to be woken for.
+      // Your own outbound activity should never trigger a push to your
+      // other devices.
+      await this.sendContent(this.selfUserId, echo, { ephemeral, notifyPush: false });
     } catch {
       // ignore — peer-side delivery already succeeded; sync convergence
       // gets a second chance on the next send.
@@ -2122,7 +2141,7 @@ export class DTelecomSecureChat {
   private async sendContent(
     peerUserId: string,
     event: ContentEvent,
-    opts: { ephemeral: boolean },
+    opts: { ephemeral: boolean; notifyPush?: boolean },
   ): Promise<void> {
     try {
       await this.sendContentInner(peerUserId, event, opts);
@@ -2173,7 +2192,7 @@ export class DTelecomSecureChat {
   private async sendContentInner(
     peerUserId: string,
     event: ContentEvent,
-    opts: { ephemeral: boolean },
+    opts: { ephemeral: boolean; notifyPush?: boolean },
   ): Promise<void> {
     const plainBytes = encodeEventBytes(event);
     const plaintext = new TextDecoder().decode(plainBytes);
@@ -2248,6 +2267,10 @@ export class DTelecomSecureChat {
     const frames = Array.from(byMsgType.entries()).map(([msgType, t]) => ({
       toUserId: peerUserId,
       ephemeral: opts.ephemeral || undefined,
+      // Wire-emit notifyPush only when explicitly false. Absent field
+      // means "legacy default = push allowed" which keeps older nodes
+      // (that don't parse the field) compatible with new SDKs.
+      notifyPush: opts.notifyPush === false ? false : undefined,
       msgType,
       targets: t,
     }));
@@ -2345,7 +2368,9 @@ export class DTelecomSecureChat {
       // a push notification for what is purely a delivery confirmation.
       // Lost wire delivery is self-healing: the next received batch (on
       // the next inbound from this peer) re-establishes the sender's UI.
-      this.sendContent(peerUserId, newReceived(ids), { ephemeral: true }).catch(() => {});
+      // notifyPush:false is a belt-and-suspenders against future
+      // ephemeral-semantics changes.
+      this.sendContent(peerUserId, newReceived(ids), { ephemeral: true, notifyPush: false }).catch(() => {});
     }
     this.pendingReceived.clear();
   }

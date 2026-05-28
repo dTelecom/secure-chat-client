@@ -13,6 +13,38 @@ control — there is no broad-deployment compat negotiation.
 
 ---
 
+## [0.13.5] — 2026-05-28
+
+### Changed
+
+- **Push notifications now fire ONLY for `text` events**. Edits,
+  deletes, conversation wipes (chatDeleteAll), read receipts (markRead),
+  delivery acks (received), typing indicators, and selfEcho fanout no
+  longer wake the recipient via push, even when the peer is offline.
+  Durability is preserved for the events that need it (edit/delete/
+  chatDeleteAll still go through the durable webhook path — they just
+  set `push: false` so the backend skips the notification).
+
+  Implementation: new `notifyPush?: boolean` wire field on
+  `ChatSendFrame`. The SDK sets `notifyPush: false` on all non-text
+  sends. The node ANDs this hint with its presence-based push
+  computation when constructing the webhook body's `push` field. The
+  backend is unchanged — it just sees `push: false` more often and
+  skips `FireChatPushIfNeeded` for those envelopes.
+
+### Compatibility
+
+- **Requires node ≥ 2026-05-28** (`livekit/pkg/chat` commit `a193b45d`)
+  for the suppression to take effect. Older nodes silently ignore the
+  unknown `notifyPush` field and continue pushing for all event types
+  (no breakage, just no effect).
+- Older SDKs (< 0.13.5) keep working against new nodes — the absent
+  `notifyPush` field maps to "legacy default = push allowed", preserving
+  prior behavior.
+- Backend (`dmeet-backend`) requires no changes.
+
+---
+
 ## [0.13.4] — 2026-05-28
 
 ### Fixed

@@ -126,6 +126,20 @@ export interface ChatSendFrame {
   kind: "chatSend";
   toUserId: string;
   ephemeral?: boolean;
+  /**
+   * Sender's hint to the node: should this envelope trigger a push
+   * notification on the recipient if they're offline? Omitted (=
+   * legacy default) means yes — the node falls back to its
+   * presence-based decision alone. Explicit `false` forces the node
+   * to set `push: false` in the webhook body regardless of presence,
+   * suppressing the push without affecting durability.
+   *
+   * Set to `false` for events that mutate or sync state without
+   * surfacing user-visible content (edit/delete/chatDeleteAll/
+   * selfEcho/read/received/typing). Only `text` events should reach
+   * the recipient as a push.
+   */
+  notifyPush?: boolean;
   msgType?: "prekey" | "normal";
   targets: ChatSendTarget[];
 }

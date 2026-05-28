@@ -205,8 +205,10 @@ describe("read/received receipts must use ephemeral wire path", () => {
     const fs = await import("node:fs/promises");
     const path = await import("node:path");
     const src = await fs.readFile(path.join(process.cwd(), "src/index.ts"), "utf8");
-    // Match the flushReceivedBatch block's sendContent call.
-    const match = src.match(/flushReceivedBatch[\s\S]*?newReceived\(ids\),\s*\{\s*ephemeral:\s*(true|false)\s*\}/);
+    // Match the flushReceivedBatch block's sendContent call. The opts
+    // object may contain other flags (notifyPush etc) — we only care
+    // that ephemeral:true is in there.
+    const match = src.match(/flushReceivedBatch[\s\S]*?newReceived\(ids\),\s*\{[^}]*ephemeral:\s*(true|false)/);
     expect(match, "flushReceivedBatch should call sendContent with newReceived(ids) and an ephemeral flag").not.toBeNull();
     expect(match![1]).toBe("true");
 
