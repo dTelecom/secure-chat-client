@@ -317,6 +317,72 @@ describe("multi-device sender status sync (sibling browser)", () => {
     await sibling.disconnect();
   });
 
+  it("peer's `read` event arrives BEFORE the selfEcho text — sibling still ends at 'read' (race fix)", async () => {
+    // Production failure pattern reproduced exactly from the user's
+    // log on 2026-06-02:
+    //   readReceipt at 35.508 — peer's read event arrived
+    //   message at 35.555 — selfEcho text arrived (registers trackOutbound)
+    //   statusChange "delivered" at 35.982 — late received event bumped
+    //                                         status but the earlier read
+    //                                         was already lost.
+    // After the StatusTracker buffer fix, the buffered read replays on
+    // trackOutbound and the sibling correctly persists "read".
+    const store = new MemoryKVStore();
+    const sibling = await connectAliceSibling(store);
+    const internals = sibling as unknown as {
+      dispatchInboundEvent: (
+        peerUserId: string,
+        peerDeviceId: string,
+        event: unknown,
+      ) => Promise<void>;
+    };
+
+    const messageId = "msg-race-fix";
+    const sentAt = Date.now() - 5000;
+
+    // STEP 1 (was lost without the fix): peer's `read` event arrives
+    // FIRST. The sibling has no outbound entry for messageId yet.
+    await internals.dispatchInboundEvent("bob", "bob-dev", {
+      v: 1,
+      type: "read",
+      id: "read-envelope-race",
+      clientSentAt: Date.now(),
+      upToId: messageId,
+    });
+    await new Promise((r) => setTimeout(r, 50));
+
+    // STEP 2: selfEcho text arrives, triggering trackOutbound and the
+    // buffer replay. The replayed onRead now finds messageId in
+    // byPeer["bob"] and bumps to "read".
+    await internals.dispatchInboundEvent("alice", "alice-dev1", {
+      v: 1,
+      type: "selfEcho",
+      id: "selfecho-envelope-race",
+      clientSentAt: sentAt,
+      originalPeer: "bob",
+      original: {
+        v: 1,
+        type: "text",
+        id: messageId,
+        clientSentAt: sentAt,
+        text: "the race-fix message",
+      },
+    });
+    await new Promise((r) => setTimeout(r, 100));
+
+    const stored = (await sibling.getHistory("bob")).find((m) => m.id === messageId);
+    expect(stored, "selfEcho should land the message").toBeDefined();
+    expect(
+      stored!.status,
+      "Even though peer's read arrived BEFORE the selfEcho text, the buffer-replay path in " +
+        "trackOutbound advances status all the way to 'read'. Without the fix this would stay " +
+        "at 'pending' (or 'delivered' if a received also came in late) and the FE would render " +
+        "the wrong status on reload.",
+    ).toBe("read");
+
+    await sibling.disconnect();
+  });
+
   it("status persists across SDK reload (the load-bearing user-visible guarantee)", async () => {
     // The original bug symptom — the FE shows the right status in
     // real-time but a page reload reverts it. After the fix the

@@ -200,6 +200,134 @@ describe("StatusTracker", () => {
     expect(tracker.getStatus("m1")).toBe("pending");
     expect(transitions).toEqual([]);
   });
+
+  // ── pending-event buffer (sibling fanout race) ─────────────────────────────
+  //
+  // On a multi-device account, a sibling device sees the selfEcho text
+  // (which triggers trackOutbound) and peer's received/read events as
+  // independent envelopes via the mesh fanout. They can arrive in any
+  // order. Before the buffer, an out-of-order peer event found no
+  // outbound entry → silently no-op → the ack was lost forever and
+  // the row stayed at "pending" / "delivered" instead of advancing
+  // to "read".
+
+  it("onRead before trackOutbound: replays through buffer on trackOutbound", () => {
+    const { tracker, transitions } = setup();
+    // Peer's read arrives FIRST referencing a messageId we haven't
+    // registered yet (the selfEcho text hasn't reached us).
+    tracker.onRead({ peerUserId: "bob", upToId: "m1" });
+    expect(tracker.getStatus("m1"), "no entry yet").toBeUndefined();
+    expect(transitions, "buffered events emit nothing until replay").toEqual([]);
+
+    // Now the selfEcho text arrives → trackOutbound registers m1 and
+    // drains the buffer, which replays onRead({ upToId: "m1" }).
+    tracker.trackOutbound({
+      messageId: "m1",
+      peerUserId: "bob",
+      envelopeToDevice: new Map([["e1", "bob-phone"]]),
+    });
+    expect(tracker.getStatus("m1"), "buffered read replayed → status = read").toBe("read");
+    expect(transitions).toEqual([{ id: "m1", status: "read", peer: "bob" }]);
+  });
+
+  it("onReceived before trackOutbound: replays through buffer on trackOutbound", () => {
+    const { tracker, transitions } = setup();
+    tracker.onReceived({ peerUserId: "bob", peerDeviceId: "bob-phone", messageIds: ["m1"] });
+    expect(tracker.getStatus("m1")).toBeUndefined();
+    expect(transitions).toEqual([]);
+
+    tracker.trackOutbound({
+      messageId: "m1",
+      peerUserId: "bob",
+      envelopeToDevice: new Map([["e1", "bob-phone"]]),
+    });
+    // bob has one device → received fully covers it → deliveredAll.
+    expect(tracker.getStatus("m1")).toBe("deliveredAll");
+    expect(transitions).toEqual([{ id: "m1", status: "deliveredAll", peer: "bob" }]);
+  });
+
+  it("onReceived + onRead both arrive before trackOutbound → final status = read", () => {
+    const { tracker, transitions } = setup();
+    // Real failure pattern from the production log on 2026-06-02:
+    // readReceipt at 35.508, message (selfEcho) at 35.555, statusChange
+    // "delivered" at 35.982. The fix should advance to "read" on
+    // trackOutbound by draining received first, then read.
+    tracker.onReceived({ peerUserId: "bob", peerDeviceId: "bob-phone", messageIds: ["m1"] });
+    tracker.onRead({ peerUserId: "bob", upToId: "m1" });
+
+    tracker.trackOutbound({
+      messageId: "m1",
+      peerUserId: "bob",
+      envelopeToDevice: new Map([["e1", "bob-phone"]]),
+    });
+
+    expect(tracker.getStatus("m1")).toBe("read");
+    // Drain order: received → read. Each bumps once.
+    expect(transitions.map((t) => t.status)).toEqual(["deliveredAll", "read"]);
+  });
+
+  it("buffered read for a messageId we never receive stays buffered (re-buffered on replay)", () => {
+    const { tracker } = setup();
+    // Peer reads up to "m-never-arrives". We never register that
+    // messageId, but we DO register an unrelated messageId "m1" for
+    // the same peer. The replay tries onRead("m-never-arrives") again,
+    // still can't find it, and re-buffers. The unrelated m1 stays at
+    // "pending" — correct: peer's "read up to X" doesn't imply read
+    // for messages with sentAt > X's sentAt.
+    tracker.onRead({ peerUserId: "bob", upToId: "m-never-arrives" });
+
+    tracker.trackOutbound({
+      messageId: "m1",
+      peerUserId: "bob",
+      envelopeToDevice: new Map([["e1", "bob-phone"]]),
+    });
+    expect(tracker.getStatus("m1")).toBe("pending");
+
+    // Later, if "m-never-arrives" finally registers, the still-buffered
+    // read should resolve at that point.
+    tracker.trackOutbound({
+      messageId: "m-never-arrives",
+      peerUserId: "bob",
+      envelopeToDevice: new Map([["e2", "bob-phone"]]),
+    });
+    expect(tracker.getStatus("m-never-arrives")).toBe("read");
+    // m1 was earlier in byPeer ordering, so it's covered by the read
+    // watermark and also advances.
+    expect(tracker.getStatus("m1")).toBe("read");
+  });
+
+  it("FIFO cap (PENDING_BUFFER_CAP=100): oldest unresolvable received entries are evicted", () => {
+    const { tracker } = setup();
+    // Push 105 unresolvable received events for the same peer.
+    for (let i = 0; i < 105; i++) {
+      tracker.onReceived({
+        peerUserId: "bob",
+        peerDeviceId: "bob-phone",
+        messageIds: [`m-evictable-${i}`],
+      });
+    }
+    // The first 5 (m-evictable-0..4) should have been evicted by the
+    // time we register them. Sanity: register the LAST one (m-evictable-104)
+    // and check it replays.
+    tracker.trackOutbound({
+      messageId: "m-evictable-104",
+      peerUserId: "bob",
+      envelopeToDevice: new Map([["e", "bob-phone"]]),
+    });
+    expect(tracker.getStatus("m-evictable-104")).toBe("deliveredAll");
+
+    // Now register an EVICTED id. The buffer should no longer hold an
+    // entry for it.
+    tracker.trackOutbound({
+      messageId: "m-evictable-0",
+      peerUserId: "bob",
+      envelopeToDevice: new Map([["e0", "bob-phone"]]),
+    });
+    expect(
+      tracker.getStatus("m-evictable-0"),
+      "evicted received event no longer replays — status stays at pending",
+    ).toBe("pending");
+  });
 });
 
 // ── MessageStore ────────────────────────────────────────────────────────────

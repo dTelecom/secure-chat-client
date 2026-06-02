@@ -48,6 +48,13 @@ export type StatusListener = (
   peerUserId: string,
 ) => void;
 
+/** Per-peer cap on each pending-event buffer (received and read).
+ *  Bounds memory if peer sends an unbounded stream of acks for
+ *  messageIds we'll never see (compromised peer, protocol bug, etc.).
+ *  FIFO eviction — the oldest unresolved event is dropped first.
+ *  100 entries × ~50 bytes per entry × N peers is bounded enough. */
+const PENDING_BUFFER_CAP = 100;
+
 export class StatusTracker {
   private outbound = new Map<string, Outbound>();
   /** Reverse index for quick lookup on chatSendResult. */
@@ -55,6 +62,23 @@ export class StatusTracker {
   /** Sorted list of (messageId, peerUserId) ordered by send time, used to
    *  resolve `read` watermarks against earlier messages. Append-only. */
   private byPeer = new Map<string, string[]>();
+
+  /** Buffered `received` events that arrived before `trackOutbound` had
+   *  registered the messageId on this device. The fanout race is
+   *  specific to sibling devices: selfEcho text (which triggers
+   *  trackOutbound) and peer's received/read events arrive
+   *  independently and can be reordered by the mesh. Without this
+   *  buffer, onReceived found no outbound entry → silent skip → the
+   *  ack was lost forever, and the row stayed at whatever earlier
+   *  status it had. Keyed by peerUserId; entries replayed by
+   *  trackOutbound for the matching peer. */
+  private pendingReceivedsForUnknown = new Map<
+    string,
+    Array<{ peerDeviceId: string; messageId: string }>
+  >();
+  /** Same idea for `read` events. Keyed by peerUserId → list of
+   *  unresolved upToIds. */
+  private pendingReadsForUnknown = new Map<string, string[]>();
 
   private listeners: StatusListener[] = [];
 
@@ -93,6 +117,32 @@ export class StatusTracker {
     const list = this.byPeer.get(opts.peerUserId) ?? [];
     list.push(opts.messageId);
     this.byPeer.set(opts.peerUserId, list);
+
+    // Drain any buffered peer events for this peer. They arrived
+    // before the messageId was registered (sibling fanout race) and
+    // were saved for replay. Drain received first so the status
+    // ladder advances through delivered → read in the same order as
+    // the happy path. The dequeue-then-replay shape avoids infinite
+    // recursion: anything that re-buffers during replay starts from
+    // an empty queue.
+    const queuedReceived = this.pendingReceivedsForUnknown.get(opts.peerUserId);
+    if (queuedReceived) {
+      this.pendingReceivedsForUnknown.delete(opts.peerUserId);
+      for (const entry of queuedReceived) {
+        this.onReceived({
+          peerUserId: opts.peerUserId,
+          peerDeviceId: entry.peerDeviceId,
+          messageIds: [entry.messageId],
+        });
+      }
+    }
+    const queuedReads = this.pendingReadsForUnknown.get(opts.peerUserId);
+    if (queuedReads) {
+      this.pendingReadsForUnknown.delete(opts.peerUserId);
+      for (const upToId of queuedReads) {
+        this.onRead({ peerUserId: opts.peerUserId, upToId });
+      }
+    }
   }
 
   /**
@@ -144,7 +194,14 @@ export class StatusTracker {
   }): void {
     for (const id of opts.messageIds) {
       const outbound = this.outbound.get(id);
-      if (!outbound) continue;
+      if (!outbound) {
+        // No outbound entry yet — the sibling device may receive
+        // peer's `received` before the selfEcho text that triggers
+        // trackOutbound (mesh fanout race). Buffer for replay; the
+        // entry is replayed in trackOutbound for this peer.
+        this.bufferReceived(opts.peerUserId, opts.peerDeviceId, id);
+        continue;
+      }
       if (outbound.peerUserId !== opts.peerUserId) continue;
       if (!outbound.peerDevices.has(opts.peerDeviceId)) {
         // Sender's device list was stale at send time; still count it.
@@ -164,11 +221,17 @@ export class StatusTracker {
    */
   onRead(opts: { peerUserId: string; upToId: string }): void {
     const list = this.byPeer.get(opts.peerUserId);
-    if (!list) return;
-    const idx = list.indexOf(opts.upToId);
-    if (idx < 0) return;
+    const idx = list ? list.indexOf(opts.upToId) : -1;
+    if (idx < 0) {
+      // upToId not in our outbound list yet — sibling devices can
+      // receive peer's `read` before the selfEcho text that triggers
+      // trackOutbound (mesh fanout race). Buffer for replay in
+      // trackOutbound for this peer.
+      this.bufferRead(opts.peerUserId, opts.upToId);
+      return;
+    }
     for (let i = 0; i <= idx; i++) {
-      const outbound = this.outbound.get(list[i]);
+      const outbound = this.outbound.get(list![i]);
       if (!outbound) continue;
       this.bump(outbound, "read");
     }
@@ -209,6 +272,33 @@ export class StatusTracker {
         // Listener errors must not break the tracker.
       }
     }
+  }
+
+  /**
+   * Append a `received` event to the per-peer replay queue. FIFO
+   * eviction beyond PENDING_BUFFER_CAP so a peer pumping out acks for
+   * messageIds we'll never see can't grow the buffer unboundedly.
+   */
+  private bufferReceived(peerUserId: string, peerDeviceId: string, messageId: string): void {
+    const buf = this.pendingReceivedsForUnknown.get(peerUserId) ?? [];
+    buf.push({ peerDeviceId, messageId });
+    while (buf.length > PENDING_BUFFER_CAP) buf.shift();
+    this.pendingReceivedsForUnknown.set(peerUserId, buf);
+  }
+
+  /**
+   * Same FIFO-cap shape for `read` upToIds. Note: a buffered `read`
+   * with upToId X stays in the buffer until trackOutbound runs for
+   * THIS peer with ANY messageId — at which point we replay every
+   * buffered upToId. If the buffered upToId still isn't resolvable
+   * (its message hasn't reached us yet), it gets re-buffered by the
+   * replayed onRead call.
+   */
+  private bufferRead(peerUserId: string, upToId: string): void {
+    const buf = this.pendingReadsForUnknown.get(peerUserId) ?? [];
+    buf.push(upToId);
+    while (buf.length > PENDING_BUFFER_CAP) buf.shift();
+    this.pendingReadsForUnknown.set(peerUserId, buf);
   }
 }
 

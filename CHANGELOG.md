@@ -13,6 +13,48 @@ control — there is no broad-deployment compat negotiation.
 
 ---
 
+## [0.13.8] — 2026-06-02
+
+### Fixed
+
+- **Sibling device sometimes stalled at "delivered" instead of "read".**
+  Production logs showed the failure pattern: peer's `read` event
+  arrived ~50ms BEFORE the selfEcho text on the sibling device. Since
+  the SDK's `StatusTracker.onRead` silently returned when `byPeer`
+  didn't contain the upToId yet, the read signal was lost. The
+  selfEcho text then ran `trackOutbound` (per 0.13.7's fix), and a
+  later `received` event bumped status to "delivered" — but the
+  earlier read was already gone. The sibling persisted "delivered"
+  instead of "read", and on reload the FE showed gray ✓✓ instead of
+  blue ✓✓.
+
+  Root cause: peer's `received`/`read` events and alice-dev1's
+  selfEcho text travel different network paths (peer → mesh → alice
+  vs alice-dev1 → mesh → alice) and arrive in any order. 0.13.7
+  assumed the selfEcho text would always come first.
+
+  Fix: `StatusTracker` now buffers `onReceived` / `onRead` calls when
+  there's no matching outbound entry yet, and drains the buffers on
+  the next `trackOutbound` for that peer. Drain order is received
+  first then read so the status ladder advances naturally through
+  delivered → read. Buffers are per-peer with a FIFO cap of 100
+  entries to bound memory under adversarial peer behavior.
+
+  This also makes the sender path more resilient against the unlikely
+  case of a peer ack landing before the local `trackOutbound`
+  registration completes — same mechanism, no special-casing.
+
+### Compatibility
+
+- Pure SDK change. No wire / node / backend modifications.
+- The buffer is in-memory only. A reload between receiving a peer
+  event and the matching selfEcho text would still lose the buffered
+  event; in the production scenario events arrived ~50ms apart so
+  this in-memory fix is sufficient. KV-backed persistence is a future
+  hardening item if cross-reload races materialize.
+
+---
+
 ## [0.13.7] — 2026-06-02
 
 ### Fixed
