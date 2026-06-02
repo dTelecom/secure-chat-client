@@ -2066,6 +2066,15 @@ export class DTelecomSecureChat {
               sentAt: inner.clientSentAt,
               editedAt: null,
               deletedAt: null,
+              // Sibling devices persist a baseline "pending" so that
+              // (a) the FE has a stable status to render before peer
+              // events arrive, and (b) the StatusTracker listener's
+              // mirror-into-message_store path finds a row to update.
+              // Without this, on reload the FE rendered (status ??
+              // "sent") for this row, which displayed single ✓ even
+              // though the user had seen ✓✓ in real-time before
+              // refresh. See test/sibling-status-sync.test.ts.
+              status: "pending",
               ...(inner.replyTo !== undefined ? { replyTo: inner.replyTo } : {}),
             });
             await this.bumpConversation({
@@ -2085,6 +2094,40 @@ export class DTelecomSecureChat {
                 ...(inner.replyTo !== undefined ? { replyTo: inner.replyTo } : {}),
               },
             });
+
+            // Register the message with the StatusTracker on this
+            // sibling device so future `received` / `read` events
+            // from the original peer (which fan out to ALL of our
+            // devices) actually advance status here too. Without
+            // this, onReceived/onRead silently no-op because they
+            // can't find an outbound entry for messageId, and the
+            // listener that mirrors status transitions into
+            // message_store never fires → status stays "pending"
+            // and the FE shows single ✓ on reload.
+            //
+            // Sibling doesn't know the originating envelopeUuids
+            // (those live on the sender's session), but
+            // onReceived/onRead key on (peerUserId, peerDeviceId,
+            // messageId), so synthetic placeholders for the map
+            // keys are fine — only the device set matters for the
+            // delivered/deliveredAll computation.
+            try {
+              const peerDevs = await this.peerDevices.getPeerDevices(originalPeer);
+              const envelopeToDevice = new Map<string, string>();
+              for (const dev of peerDevs) {
+                envelopeToDevice.set(`sibling:${inner.id}:${dev.deviceId}`, dev.deviceId);
+              }
+              this.status.trackOutbound({
+                messageId: inner.id,
+                peerUserId: originalPeer,
+                envelopeToDevice,
+              });
+            } catch {
+              // peerDevices lookup is best-effort. If the network is
+              // unreachable we fall back to the pre-fix behavior
+              // (no status tracking for this row); no worse than
+              // shipping without the fix.
+            }
             return;
           }
           case "edit": {

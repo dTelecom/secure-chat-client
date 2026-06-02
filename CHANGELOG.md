@@ -13,6 +13,52 @@ control — there is no broad-deployment compat negotiation.
 
 ---
 
+## [0.13.7] — 2026-06-02
+
+### Fixed
+
+- **Sibling-device message status reverted to "sent" on reload.** Users
+  with two browser windows open on the same account saw their own
+  outbound message statuses behave differently after reload: the
+  sending window kept ✓✓, the other window reverted to single ✓
+  "sent". Root cause: in `dispatchInboundEvent`'s selfEcho text
+  handler, the SDK persisted the row WITHOUT a `status` field AND
+  never called `status.trackOutbound(...)` for the message. So when
+  the original peer's `received` / `read` events arrived on the
+  sibling (the peer fanout reaches all of own user's devices), the
+  StatusTracker's `onReceived` / `onRead` paths couldn't find an
+  outbound entry by messageId and silently no-op'd. The listener that
+  mirrors status into `message_store` never fired, so the row kept
+  `status === undefined`; on reload `MessageBubble` rendered
+  `(status ?? "sent")` → single ✓. The FE *did* show the correct
+  status in real-time via `readReceipt`/React-state — but the
+  persistence was missing.
+
+  Fix: the selfEcho text handler now (a) seeds the row with
+  `status: "pending"` so there's a baseline target for the listener
+  to update, and (b) calls `status.trackOutbound` populated from
+  `peerDevices.getPeerDevices(originalPeer)` so the StatusTracker
+  recognizes the messageId for the original peer's subsequent
+  `received` / `read` events. Result: sibling devices persist
+  "delivered" / "deliveredAll" / "read" correctly and the status
+  survives reload.
+
+  Multi-device peer correctness preserved: with bob having two
+  devices, the sibling correctly distinguishes "delivered" (one of
+  two confirmed) from "deliveredAll" (both confirmed) — matching the
+  sender's behavior.
+
+### Compatibility
+
+- Pure SDK change. No wire / node / backend protocol modifications.
+- Existing installs upgrading: the fix only affects rows persisted
+  AFTER the upgrade. Sibling rows persisted by older SDK versions
+  keep their (undefined) status until the next inbound selfEcho or
+  peer event re-anchors them; not worth a migration since status
+  re-converges naturally from any subsequent activity.
+
+---
+
 ## [0.13.6] — 2026-06-02
 
 ### Fixed
