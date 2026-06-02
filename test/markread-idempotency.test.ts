@@ -1,17 +1,18 @@
-// Regression test for read/received receipts triggering offline push.
+// Regression tests for markRead's lastReadSent idempotency gate.
 //
-// Before the fix, markRead and the received-batch flusher used the
-// durable wire path (`ephemeral: false`). When the peer was offline,
-// every "your read indicator advanced" / "✓✓ delivered" event landed
-// in the backend's webhook → fired a push notification. That meant:
-//   - opening a chat with offline peer → push (markRead)
-//   - just RECEIVING a message → push back to the sender (received)
-//   - reloading the page while peer offline → another markRead push,
-//     because the FE's lastMarkedReadRef resets on mount.
+// Background: FE consumers (dmeet web + RN) auto-fire markRead from a
+// useEffect tied to the latest inbound messageId. That id is stable
+// across page reloads, but their in-memory dedup ref resets on
+// component mount. Combined with 0.13.6 making read receipts durable
+// on the wire, every reload would otherwise generate a fresh chatSend
+// frame to all of peer's devices + selfEcho fanout — wire traffic and
+// backend pending-queue churn that scales with reload count.
 //
-// After the fix, both paths use `ephemeral: true`. Test: capture the
-// outbound chatSend frames and assert the ephemeral flag is set on
-// both read and received events.
+// 0.13.7 added a persisted `lastReadSent[peerUserId]` watermark. The
+// gate fires when the requested `upToMessageId` has sentAt > lastSent.
+// Updated after a successful sendContent. Also bumped when a sibling's
+// selfEcho-of-read arrives (= "another device already shipped on the
+// user's behalf; don't re-ship").
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { DTelecomSecureChat } from "../src/index.js";
@@ -129,11 +130,12 @@ interface CapturedChatSend {
   kind: "chatSend";
   toUserId: string;
   ephemeral?: boolean;
+  notifyPush?: boolean;
   msgType?: string;
   targets: Array<{ deviceId: string; ciphertext: string; envelopeUuid: string }>;
 }
 
-function findChatSendsTo(toUserId: string): CapturedChatSend[] {
+function chatSendsTo(toUserId: string): CapturedChatSend[] {
   return sentFrames.filter(
     (f): f is CapturedChatSend =>
       (f as { kind?: string }).kind === "chatSend" && (f as CapturedChatSend).toUserId === toUserId,
@@ -148,80 +150,106 @@ async function waitFor(predicate: () => boolean, timeoutMs = 2000): Promise<void
   }
 }
 
-describe("read/received receipts must use ephemeral wire path", () => {
-  it("markRead emits a chatSend with ephemeral: true", async () => {
+async function seedInbound(store: MemoryKVStore, msgId: string, sentAt: number): Promise<void> {
+  const messages = new MessageStore(new ScopedKVStore(store, "alice"));
+  await messages.put({
+    id: msgId,
+    peerUserId: "bob",
+    senderUserId: "bob",
+    text: `inbound ${msgId}`,
+    sentAt,
+    editedAt: null,
+    deletedAt: null,
+  });
+}
+
+describe("markRead idempotency (lastReadSent watermark)", () => {
+  it("a fresh SDK on a store with lastReadSent persisted does NOT re-ship the same watermark", async () => {
     const store = new MemoryKVStore();
-    const messages = new MessageStore(new ScopedKVStore(store, "alice"));
-    // Seed an inbound message so markRead has a target.
-    await messages.put({
-      id: "inbound-1",
-      peerUserId: "bob",
-      senderUserId: "bob",
-      text: "hi alice",
-      sentAt: Date.now() - 1000,
-      editedAt: null,
-      deletedAt: null,
-    });
+    await seedInbound(store, "msg-1", 100_000);
+
+    const alice = await connectAlice(store);
+    await alice.markRead("bob", "msg-1");
+    await waitFor(() => chatSendsTo("bob").length >= 1);
+    const initialFrameCount = chatSendsTo("bob").length;
+    expect(initialFrameCount, "first markRead should ship a read receipt").toBeGreaterThanOrEqual(1);
+    await alice.disconnect();
+
+    // Simulate page reload: fresh SDK instance on the SAME persisted store.
+    // The FE auto-fires markRead in the same useEffect on mount.
+    const alice2 = await connectAlice(store);
+    await alice2.markRead("bob", "msg-1");
+    // Give the SDK ample time to process and emit any new frames.
+    await new Promise((r) => setTimeout(r, 200));
+
+    const finalFrameCount = chatSendsTo("bob").length;
+    expect(
+      finalFrameCount,
+      "second markRead with same upToMessageId should NOT generate additional wire traffic " +
+        "(lastReadSent gate). The FE's reload-fire pattern would otherwise spam the backend pending queue.",
+    ).toBe(initialFrameCount);
+
+    await alice2.disconnect();
+  });
+
+  it("markRead with a HIGHER watermark still ships (lastReadSent only suppresses same-or-lower)", async () => {
+    const store = new MemoryKVStore();
+    await seedInbound(store, "msg-old", 100_000);
+    await seedInbound(store, "msg-new", 200_000);
 
     const alice = await connectAlice(store);
 
-    await alice.markRead("bob", "inbound-1");
-    await waitFor(() => findChatSendsTo("bob").length >= 1);
+    await alice.markRead("bob", "msg-old");
+    await waitFor(() => chatSendsTo("bob").length >= 1);
+    const afterFirst = chatSendsTo("bob").length;
 
-    const sends = findChatSendsTo("bob");
-    // markRead sends one chatSend to bob. If selfEcho also ran (alice
-    // has other devices), there'd be an additional chatSend to alice —
-    // we explicitly filter to bob-targeted frames so the assertion is
-    // about the read receipt to the sender only.
-    expect(sends.length).toBeGreaterThanOrEqual(1);
-    for (const send of sends) {
-      expect(send.ephemeral).toBe(true);
-    }
+    await alice.markRead("bob", "msg-new");
+    await waitFor(() => chatSendsTo("bob").length > afterFirst);
+
+    expect(
+      chatSendsTo("bob").length,
+      "second markRead with a higher-sentAt watermark must ship",
+    ).toBeGreaterThan(afterFirst);
 
     await alice.disconnect();
   });
 
-  it("received-batch flush emits a chatSend with ephemeral: true", async () => {
+  it("markRead for an UNKNOWN messageId silently skips (no wire frame, no thrown error)", async () => {
     const store = new MemoryKVStore();
     const alice = await connectAlice(store);
 
-    // Trigger the received-ack path: send a text from alice, then
-    // simulate an inbound text from bob that alice receives — this
-    // queues a received-ack and after ~500ms fires the flush.
-    //
-    // Simpler: directly synthesize an inbound message event so the SDK
-    // queues a received-ack and the batch flush fires. We don't have a
-    // direct hook for that without dispatchInboundEvent, so we use the
-    // sendText path to register session keys, then drive an inbound
-    // through the same crypto adapter.
-    //
-    // For a minimal regression test, simulate a markRead flow that
-    // independently exercises the received batch is harder — instead
-    // we'll assert at the implementation level: load the SDK source
-    // and verify the flushReceivedBatch line uses ephemeral:true. This
-    // is a structural test; the unit-level "ephemeral propagates to
-    // wire" is already covered by the markRead test above (same
-    // sendContent code path).
-    const fs = await import("node:fs/promises");
-    const path = await import("node:path");
-    const src = await fs.readFile(path.join(process.cwd(), "src/index.ts"), "utf8");
-    // Match the flushReceivedBatch block's sendContent call. The opts
-    // object may contain other flags (notifyPush etc) — we only care
-    // that ephemeral:true is in there.
-    const match = src.match(/flushReceivedBatch[\s\S]*?newReceived\(ids\),\s*\{[^}]*ephemeral:\s*(true|false)/);
-    expect(match, "flushReceivedBatch should call sendContent with newReceived(ids) and an ephemeral flag").not.toBeNull();
-    expect(match![1]).toBe("true");
+    // Without seeding the inbound row, the messageId is unknown to
+    // messages.get → markRead returns without sending.
+    await alice.markRead("bob", "nonexistent-id");
+    await new Promise((r) => setTimeout(r, 100));
+
+    const sends = chatSendsTo("bob");
+    expect(sends.length, "unknown messageId should not generate a chatSend").toBe(0);
 
     await alice.disconnect();
   });
 
-  it("selfEcho of a 'read' event also uses ephemeral: true (no push to sibling devices)", async () => {
-    const fs = await import("node:fs/promises");
-    const path = await import("node:path");
-    const src = await fs.readFile(path.join(process.cwd(), "src/index.ts"), "utf8");
-    // Match the selfEcho block. The ephemeral decision is based on the
-    // event type. Ensure the source explicitly handles "read".
-    const match = src.match(/private async selfEcho[\s\S]*?const ephemeral\s*=\s*original\.type\s*===\s*"read"/);
-    expect(match, "selfEcho should mark 'read' events as ephemeral").not.toBeNull();
+  it("repeated markRead within the same SDK instance only ships once", async () => {
+    const store = new MemoryKVStore();
+    await seedInbound(store, "msg-1", 100_000);
+    const alice = await connectAlice(store);
+
+    await alice.markRead("bob", "msg-1");
+    await waitFor(() => chatSendsTo("bob").length >= 1);
+    const afterFirst = chatSendsTo("bob").length;
+
+    // Three additional calls with the same watermark — none should
+    // produce new wire frames.
+    await alice.markRead("bob", "msg-1");
+    await alice.markRead("bob", "msg-1");
+    await alice.markRead("bob", "msg-1");
+    await new Promise((r) => setTimeout(r, 100));
+
+    expect(
+      chatSendsTo("bob").length,
+      "repeated markRead within one SDK instance should be a no-op past the first shipment",
+    ).toBe(afterFirst);
+
+    await alice.disconnect();
   });
 });

@@ -13,6 +13,55 @@ control — there is no broad-deployment compat negotiation.
 
 ---
 
+## [0.13.6] — 2026-06-02
+
+### Fixed
+
+- **Multi-device read/received sync was broken**. 0.13.4 switched
+  `markRead`, `flushReceivedBatch`, and `selfEcho`-of-read to
+  `ephemeral: true` as a quick-fix for offline-push noise. 0.13.5 kept
+  ephemeral in place "for belt-and-suspenders" alongside the new
+  `notifyPush: false` hint. The hidden side effect: when a peer
+  (or sibling device) was offline at the moment of a receipt, the
+  ephemeral fast-path on the node skipped the webhook fallback
+  entirely, so the offline device never received the envelope via
+  drainPending. Users with 2+ devices saw "read by peer" on device 1
+  and "not read" on device 2 forever — until B sent another markRead
+  with a higher watermark *while device 2 was online*. This release
+  reverts all three sites to the **durable** wire path while keeping
+  `notifyPush: false` to suppress the push (the node ANDs the
+  presence-based push decision with the SDK hint). Offline siblings
+  now get the receipt on reconnect via the standard pending-queue
+  drain. Requires node ≥ commit a193b45d for the push suppression to
+  work (already deployed 2026-05-28).
+
+### Added
+
+- **`markRead` idempotency via a persisted `lastReadSent` watermark.**
+  FE consumers (dmeet web + RN) auto-fire `markRead` from a useEffect
+  tied to the latest inbound messageId. That id is stable across page
+  reloads, but their in-memory dedup ref resets on component mount.
+  Combined with the move to durable receipts above, this meant every
+  reload generated a fresh chatSend frame to all of peer's devices
+  plus selfEcho fanout — wire traffic and backend pending-queue churn
+  that scaled with reload count. The SDK now persists a per-peer
+  `lastReadSent` sentAt in KV. `markRead` skips the wire send when
+  `upToMessageId.sentAt <= lastReadSent`. The watermark is also
+  bumped when a sibling device's selfEcho-of-read arrives, so siblings
+  don't each independently re-ship the same receipt on their own
+  reloads. First markRead per peer per install still ships normally;
+  higher watermarks still ship normally; only true no-op repeats are
+  suppressed.
+
+### Compatibility
+
+- Pure SDK change. No wire / node / backend protocol modifications.
+- Existing installs upgrading: `lastReadSent/*` keys start empty → first
+  markRead post-upgrade ships normally → subsequent calls dedupe.
+- Older SDKs continue their previous behavior unchanged.
+
+---
+
 ## [0.13.5] — 2026-05-28
 
 ### Changed

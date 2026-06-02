@@ -450,6 +450,16 @@ const RECEIVED_BATCH_FLUSH_MS = 500;
 const RECEIVED_BATCH_FLUSH_SIZE = 50;
 const READ_RECEIPTS_KEY = "prefs/readReceiptsEnabled";
 const BLOCKED_USERS_KEY = "prefs/blockedUserIds";
+/**
+ * Per-peer "last read watermark we shipped to the peer FROM THIS DEVICE"
+ * (sentAt of the upToMessageId). Keyed by peerUserId. Drives the
+ * markRead idempotency gate so the FE's auto-fire-on-mount pattern
+ * doesn't generate fresh envelopes on every reload for the same
+ * watermark. Bumped by both the outbound markRead path and the
+ * inbound selfEcho `read` handler (= "a sibling already shipped this
+ * watermark on behalf of our user; this device shouldn't re-ship").
+ */
+const lastReadSentKey = (peerUserId: string): string => `lastReadSent/${peerUserId}`;
 
 /** Public shape returned by `getKnownPeerDevices()`. */
 export interface KnownPeerDevice {
@@ -883,22 +893,48 @@ export class DTelecomSecureChat {
     // setReadReceiptsEnabled.
     await this.bumpReadWatermark(peerUserId, upToMessageId);
     if (!(await this.areReadReceiptsEnabled())) return;
+
+    // Idempotency gate. FE consumers (dmeet web + RN) auto-fire markRead
+    // from a useEffect that depends on the latest inbound messageId —
+    // which is stable across reloads. Their in-memory dedup ref resets
+    // on component mount, so every page reload would otherwise generate
+    // a fresh durable envelope to all of peer's devices AND a selfEcho
+    // fanout, accumulating in the backend's pending queue (each ~500B,
+    // 4-6 devices, multiple reloads per session). The lastReadSent
+    // watermark survives reload so we skip the wire when the requested
+    // upToMessageId doesn't advance what we've already shipped.
+    const target = await this.messages.get(upToMessageId);
+    if (!target) {
+      // Unknown messageId — can't anchor against sentAt. Skip the wire
+      // to avoid shipping a dangling reference; a future markRead with
+      // a known id will fire.
+      return;
+    }
+    const lastSent = await this.getLastReadSent(peerUserId);
+    if (lastSent !== null && target.sentAt <= lastSent) {
+      return;
+    }
+
     const event = newRead(upToMessageId);
-    // ephemeral:true — read receipts are informational state sync.
-    // Going through the durable webhook path would generate a push
-    // notification to the original sender for every "your read indicator
-    // advanced" event, which is noise (the FE re-fires markRead on every
-    // chat mount, including page reload). Lost wire delivery is
-    // self-healing: the next markRead with a higher watermark
-    // re-establishes the sender's UI. See `flushReceivedBatch` for the
-    // same reasoning applied to `received`.
+    // ephemeral:false (durable) + notifyPush:false (silent). Read
+    // receipts fan out to ALL of the peer's devices via the chatSend
+    // targets; without durable delivery, any peer device offline at
+    // the moment of markRead permanently misses the receipt and its
+    // UI never advances to "read" for the affected messages — a real
+    // bug observed in multi-device users after 0.13.4 switched this
+    // path to ephemeral. The notifyPush hint (0.13.5) suppresses the
+    // push notification at the node so durable delivery doesn't
+    // mean "wake up the offline target", which was the original
+    // motivation for the ephemeral hack in 0.13.4.
     //
-    // notifyPush:false is a belt-and-suspenders. Ephemerals skip the
-    // webhook entirely so push wouldn't fire anyway, but if someone
-    // later changes the ephemeral semantics, the hint preserves the
-    // "no push for read receipts" guarantee.
-    await this.sendContent(peerUserId, event, { ephemeral: true, notifyPush: false });
+    // Requires node ≥ commit a193b45d to honor notifyPush; older
+    // nodes would push for read receipts to offline targets.
+    await this.sendContent(peerUserId, event, { ephemeral: false, notifyPush: false });
     await this.selfEcho(peerUserId, event);
+
+    // Persist AFTER successful send. If sendContent throws (peer_unreachable
+    // / wire error), lastReadSent stays put and the next markRead retries.
+    await this.setLastReadSent(peerUserId, target.sentAt);
   }
 
   setTyping(peerUserId: string, isTyping: boolean): void {
@@ -1830,6 +1866,38 @@ export class DTelecomSecureChat {
     }
   }
 
+  /**
+   * Read the highest read-watermark sentAt this device has SHIPPED
+   * to `peerUserId` (i.e., the upToMessageId.sentAt of the last
+   * successful markRead wire send, or the highest selfEcho-of-read
+   * sentAt observed from a sibling device). Returns null if we've
+   * never shipped a read receipt to this peer from this device.
+   *
+   * Distinct from the LOCAL read watermark (`conversations.markReadUpTo`):
+   * that one reflects "which messages did we display to the user",
+   * this one reflects "which watermark have we told peer about".
+   * They're usually equal but diverge when the read-receipts pref is
+   * off (we mark locally but never ship) or when a sibling device
+   * shipped first (we adopt without re-shipping).
+   */
+  private async getLastReadSent(peerUserId: string): Promise<number | null> {
+    const raw = await this.store.getString(lastReadSentKey(peerUserId));
+    if (!raw) return null;
+    const parsed = parseInt(raw, 10);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+
+  /**
+   * Persist the highest read-watermark sentAt this device has shipped
+   * (or that a sibling shipped on our user's behalf). Idempotent —
+   * never moves backwards.
+   */
+  private async setLastReadSent(peerUserId: string, sentAt: number): Promise<void> {
+    const current = await this.getLastReadSent(peerUserId);
+    if (current !== null && current >= sentAt) return;
+    await this.store.setString(lastReadSentKey(peerUserId), String(sentAt));
+  }
+
   /** Central dispatch for `conversationsChanged` — always computes the
    *  current `totalUnread` so the badge updates from a single listener. */
   private async emitConversationsChanged(changed: string[]): Promise<void> {
@@ -2060,6 +2128,17 @@ export class DTelecomSecureChat {
             // own devices.
             this.status.onRead({ peerUserId: originalPeer, upToId: inner.upToId });
             await this.bumpReadWatermark(originalPeer, inner.upToId);
+
+            // A sibling device of ours already shipped this watermark to
+            // peer on the user's behalf. Bump lastReadSent so this
+            // device's future markRead(...) calls for this (or earlier)
+            // watermark skip the redundant wire send — preventing
+            // siblings from each independently re-shipping the same
+            // read receipt on their own page reloads.
+            const inboundMsg = await this.messages.get(inner.upToId);
+            if (inboundMsg) {
+              await this.setLastReadSent(originalPeer, inboundMsg.sentAt);
+            }
             return;
           }
           case "chatDeleteSelf": {
@@ -2119,19 +2198,17 @@ export class DTelecomSecureChat {
           return;
         }
       }
-      // Informational sync goes ephemeral so an offline sibling device
-      // doesn't get a push notification for "your read indicator
-      // advanced." Durable user-content events (text/edit/delete/
-      // chatDeleteAll) stay non-ephemeral so siblings drain them on
-      // next reconnect and the local history converges.
-      // (`received` is not in SelfEchoableEvent — siblings independently
-      // fire their own `received` for the messages they receive.)
-      const ephemeral = original.type === "read";
-      // notifyPush:false unconditionally — selfEcho is sibling-device
-      // state sync, never something the user needs to be woken for.
-      // Your own outbound activity should never trigger a push to your
-      // other devices.
-      await this.sendContent(this.selfUserId, echo, { ephemeral, notifyPush: false });
+      // Always durable + notifyPush:false. SelfEcho is sibling-device
+      // state sync, never something the user needs to be woken for —
+      // notifyPush:false handles the no-push concern. Durable delivery
+      // ensures offline siblings drain the event on next reconnect, so
+      // their local history converges with the device that initiated
+      // the action. Previously (0.13.5) we made selfEcho of `read`
+      // events ephemeral to avoid pushing siblings, but that caused
+      // the same offline-sibling-misses-the-event bug as the peer
+      // path: notifyPush is the right tool for "don't push", not
+      // ephemeral.
+      await this.sendContent(this.selfUserId, echo, { ephemeral: false, notifyPush: false });
     } catch {
       // ignore — peer-side delivery already succeeded; sync convergence
       // gets a second chance on the next send.
@@ -2363,14 +2440,14 @@ export class DTelecomSecureChat {
     if (this.pendingReceived.size === 0) return;
     for (const [key, ids] of this.pendingReceived.entries()) {
       const [peerUserId] = key.split("|");
-      // ephemeral:true — `received` is an informational ✓✓ signal back
-      // to the sender. Going through the durable webhook path generates
-      // a push notification for what is purely a delivery confirmation.
-      // Lost wire delivery is self-healing: the next received batch (on
-      // the next inbound from this peer) re-establishes the sender's UI.
-      // notifyPush:false is a belt-and-suspenders against future
-      // ephemeral-semantics changes.
-      this.sendContent(peerUserId, newReceived(ids), { ephemeral: true, notifyPush: false }).catch(() => {});
+      // ephemeral:false (durable) + notifyPush:false (silent). Same
+      // reasoning as markRead: the receipt fans out to all of the
+      // sender's devices; any device offline at flush time would
+      // permanently miss the ✓✓ if the wire send was ephemeral, and
+      // the sender's UI would show ✓ forever on that device. Push is
+      // still suppressed via notifyPush so durable delivery doesn't
+      // wake the sender.
+      this.sendContent(peerUserId, newReceived(ids), { ephemeral: false, notifyPush: false }).catch(() => {});
     }
     this.pendingReceived.clear();
   }

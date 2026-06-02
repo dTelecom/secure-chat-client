@@ -254,7 +254,13 @@ describe("notifyPush wire flag — only text is push-worthy", () => {
     await alice.disconnect();
   });
 
-  it("markRead sets notifyPush: false (and ephemeral: true)", async () => {
+  it("markRead sets notifyPush:false on a durable wire path (no ephemeral)", async () => {
+    // 0.13.6: markRead reverted from ephemeral:true back to durable
+    // so offline sibling devices drain the read receipt via
+    // /envelopes/pending on reconnect. notifyPush:false handles push
+    // suppression at the node-side AND-gate. See receipts-durable
+    // and multi-device-receipt-sync tests for the multi-device bug
+    // that motivated the revert.
     const store = new MemoryKVStore();
     const messages = new MessageStore(new ScopedKVStore(store, "alice"));
     await messages.put({
@@ -275,7 +281,9 @@ describe("notifyPush wire flag — only text is push-worthy", () => {
     expect(sends.length).toBeGreaterThanOrEqual(1);
     for (const s of sends) {
       expect(s.notifyPush).toBe(false);
-      expect(s.ephemeral).toBe(true);
+      // ephemeral is wire-emitted only when true (`opts.ephemeral || undefined`)
+      // so the durable path leaves it undefined on the parsed frame.
+      expect(s.ephemeral).toBeUndefined();
     }
 
     await alice.disconnect();
