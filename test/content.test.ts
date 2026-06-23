@@ -8,6 +8,7 @@ import {
   decodeEventBytes,
   encodeEvent,
   encodeEventBytes,
+  newApp,
   newDelete,
   newEdit,
   newRead,
@@ -67,6 +68,21 @@ describe("encode/decode roundtrip", () => {
     const decoded = decodeEventBytes(encodeEventBytes(ev));
     expect(decoded).toEqual(ev);
   });
+
+  it("app event with structured payload", () => {
+    const ev = newApp("call", { mediaKey: "AAA…base64", alg: "AES-GCM" });
+    const decoded = decodeEvent(encodeEvent(ev));
+    expect(decoded).toEqual(ev);
+    expect(decoded?.type === "app" && decoded.ns).toBe("call");
+    expect(decoded?.type === "app" && (decoded.payload as { alg: string }).alg).toBe("AES-GCM");
+  });
+
+  it("app event with falsy-but-valid payload (null / 0 / false / '')", () => {
+    for (const payload of [null, 0, false, ""]) {
+      const ev = newApp("call", payload);
+      expect(decodeEvent(encodeEvent(ev))).toEqual(ev);
+    }
+  });
 });
 
 describe("forward-compat drops on unknown / future shapes", () => {
@@ -120,6 +136,17 @@ describe("forward-compat drops on unknown / future shapes", () => {
       clientSentAt: 1,
       ids: ["good", 42 as unknown as string],
     });
+    expect(decodeEvent(raw)).toBeNull();
+  });
+
+  it("drops app event with missing or empty ns", () => {
+    const base = { v: 1, id: "x", type: "app", clientSentAt: 1, payload: { k: 1 } };
+    expect(decodeEvent(JSON.stringify(base))).toBeNull(); // no ns
+    expect(decodeEvent(JSON.stringify({ ...base, ns: "" }))).toBeNull(); // empty ns
+  });
+
+  it("drops app event with no payload field", () => {
+    const raw = JSON.stringify({ v: 1, id: "x", type: "app", clientSentAt: 1, ns: "call" });
     expect(decodeEvent(raw)).toBeNull();
   });
 });
@@ -180,6 +207,18 @@ describe("selfEcho (multi-device sync) codec", () => {
       clientSentAt: 1,
       originalPeer: "bob",
       original: { v: 1, id: "y", type: "received", clientSentAt: 1, ids: ["a"] },
+    });
+    expect(decodeEvent(raw)).toBeNull();
+  });
+
+  it("drops selfEcho whose inner type is non-syncable (app)", () => {
+    const raw = JSON.stringify({
+      v: 1,
+      id: "x",
+      type: "selfEcho",
+      clientSentAt: 1,
+      originalPeer: "bob",
+      original: { v: 1, id: "y", type: "app", clientSentAt: 1, ns: "call", payload: {} },
     });
     expect(decodeEvent(raw)).toBeNull();
   });

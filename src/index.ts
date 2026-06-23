@@ -5,6 +5,7 @@ import { CONTENT_PROTOCOL_VERSION as _CONTENT_VERSION, EDIT_WINDOW_MS } from "./
 import {
   decodeEventBytes,
   encodeEventBytes,
+  newApp,
   newChatDeleteAll,
   newChatDeleteSelf,
   newDelete,
@@ -161,6 +162,20 @@ export interface MessageReceived {
    *  message arrived via self-echo from another own device. */
   senderUserId: string;
   message: { id: string; text: string; replyTo?: string; sentAt: number };
+}
+
+/** Inbound generic app event (see AppEvent / sendAppEvent). Delivered via
+ *  the "appEvent" listener; never surfaces as a chat "message". */
+export interface AppEventReceived {
+  peerUserId: string;
+  /** The peer device that sent it — reply/answer correlation. */
+  peerDeviceId: string;
+  ns: string;
+  payload: unknown;
+  /** Sender's content-event id (for app-level de-dup if needed). */
+  id: string;
+  /** Sender compose time, ms epoch. Display/ordering hint only. */
+  clientSentAt: number;
 }
 
 export interface MessageEdited {
@@ -427,6 +442,7 @@ export interface ConversationDeletedByPeerEvt {
 
 interface EventMap {
   message: MessageReceived;
+  appEvent: AppEventReceived;
   messageEdited: MessageEdited;
   messageDeleted: MessageDeleted;
   readReceipt: ReadReceiptEvent;
@@ -939,6 +955,39 @@ export class DTelecomSecureChat {
 
   setTyping(peerUserId: string, isTyping: boolean): void {
     this.typingMgr.setTyping(peerUserId, isTyping);
+  }
+
+  /**
+   * Send a generic encrypted app event to every device of `peerUserId`.
+   * NOT a chat message: no history, no conversation row, no chat push.
+   *
+   * Durable by default — spooled to /envelopes/pending and delivered when
+   * the peer reconnects (needed when the peer learns of the interaction out
+   * of band, e.g. a VoIP-pushed call while their chat WS is closed). Pass
+   * { ephemeral: true } for fire-and-forget WS-only delivery (dropped if the
+   * peer's WS isn't open) — e.g. mid-session signaling where both ends are
+   * already connected.
+   *
+   * Returns the event id. Throws ChatError("peer_unreachable") on a durable
+   * send when the peer has no chat-registered devices (or has blocked us);
+   * ephemeral sends to an unreachable peer resolve silently.
+   *
+   * Inbound events surface via `on("appEvent", …)`. Both peers must run an
+   * SDK version that understands the "app" content type — older receivers
+   * silently drop it (forward-compat contract).
+   */
+  async sendAppEvent(
+    peerUserId: string,
+    ns: string,
+    payload: unknown,
+    opts?: { ephemeral?: boolean },
+  ): Promise<string> {
+    const event = newApp(ns, payload);
+    await this.sendContent(peerUserId, event, {
+      ephemeral: opts?.ephemeral ?? false,
+      notifyPush: false,
+    });
+    return event.id;
   }
 
   // ── public API: preferences ───────────────────────────────────────────────
@@ -2014,6 +2063,20 @@ export class DTelecomSecureChat {
       }
       case "typing": {
         this.dispatch("typing", { peerUserId, peerDeviceId, state: event.state });
+        return;
+      }
+      case "app": {
+        // Generic app event — hand straight to the consumer. Not persisted
+        // and not status-tracked; the envelope-level ack after this returns
+        // removes it from /envelopes/pending (durable sends).
+        this.dispatch("appEvent", {
+          peerUserId,
+          peerDeviceId,
+          ns: event.ns,
+          payload: event.payload,
+          id: event.id,
+          clientSentAt: event.clientSentAt,
+        });
         return;
       }
       case "chatDeleteSelf": {

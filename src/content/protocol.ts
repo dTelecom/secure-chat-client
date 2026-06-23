@@ -109,6 +109,22 @@ export interface ChatDeleteAllEvent extends BaseEvent {
   type: "chatDeleteAll";
 }
 
+/**
+ * Generic application event carried over the Olm channel. NOT a chat
+ * message: never persisted to history, never creates a conversation row,
+ * never raises a push. `ns` namespaces the consumer (e.g. "call"); `payload`
+ * is any JSON-serializable value the app defines and the SDK treats as
+ * opaque. Deliberately excluded from SelfEchoableEvent — app events are not
+ * mirrored to the sender's sibling devices.
+ */
+export interface AppEvent extends BaseEvent {
+  type: "app";
+  /** App namespace, e.g. "call". Non-empty. */
+  ns: string;
+  /** App-defined, JSON-serializable. Opaque to the SDK. */
+  payload: unknown;
+}
+
 /** Multi-device self-echo (Signal "sync messages"). Sent by the originator
  *  to its own user (filtered: not back to the sender's own device) so the
  *  user's other devices observe outbound traffic from this device. The
@@ -137,7 +153,8 @@ export type ContentEvent =
   | TypingEvent
   | SelfEchoEvent
   | ChatDeleteSelfEvent
-  | ChatDeleteAllEvent;
+  | ChatDeleteAllEvent
+  | AppEvent;
 
 export type ContentEventType = ContentEvent["type"];
 
@@ -284,6 +301,18 @@ export function decodeEvent(plaintext: string): ContentEvent | null {
         clientSentAt: obj.clientSentAt,
       };
     }
+    case "app": {
+      if (typeof obj.ns !== "string" || !obj.ns) return null;
+      if (!("payload" in obj)) return null;
+      return {
+        v: 1,
+        id: obj.id,
+        type: "app",
+        clientSentAt: obj.clientSentAt,
+        ns: obj.ns,
+        payload: obj.payload,
+      };
+    }
     default:
       return null;
   }
@@ -344,6 +373,10 @@ export function newChatDeleteSelf(peerUserId: string): ChatDeleteSelfEvent {
 
 export function newChatDeleteAll(): ChatDeleteAllEvent {
   return { v: 1, id: newId(), type: "chatDeleteAll", clientSentAt: Date.now() };
+}
+
+export function newApp(ns: string, payload: unknown): AppEvent {
+  return { v: 1, id: newId(), type: "app", clientSentAt: Date.now(), ns, payload };
 }
 
 export function newSelfEcho(originalPeer: string, original: SelfEchoableEvent): SelfEchoEvent {

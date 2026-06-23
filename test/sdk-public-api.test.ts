@@ -479,6 +479,41 @@ describe("DTelecomSecureChat — 0.5.0 surfaces", () => {
   });
 });
 
+describe("DTelecomSecureChat — app events (sendAppEvent / appEvent)", () => {
+  it("durable sendAppEvent to a peer with no devices throws peer_unreachable", async () => {
+    // claim_all returns [] in the mock → encryptForPeer yields no targets.
+    // A durable send must surface peer_unreachable (same contract as a
+    // durable text/markRead), so the call layer can treat the call as
+    // un-keyable — mirrors the backend e2ee_setup_required precondition.
+    const sdk = await connectAlice(new MemoryKVStore());
+    let caught: ChatError | null = null;
+    try {
+      await sdk.sendAppEvent("bob", "call", { mediaKey: "k" });
+    } catch (err) {
+      caught = err as ChatError;
+    }
+    expect(caught).toBeInstanceOf(ChatError);
+    expect(caught!.code).toBe("peer_unreachable");
+    await sdk.disconnect();
+  });
+
+  it("ephemeral sendAppEvent to an unreachable peer resolves with the event id (no throw)", async () => {
+    const sdk = await connectAlice(new MemoryKVStore());
+    const id = await sdk.sendAppEvent("bob", "call", { mediaKey: "k" }, { ephemeral: true });
+    expect(typeof id).toBe("string");
+    expect(id.length).toBeGreaterThan(0);
+    await sdk.disconnect();
+  });
+
+  it("appEvent listener registers and returns an unsubscribe fn", async () => {
+    const sdk = await connectAlice(new MemoryKVStore());
+    const off = sdk.on("appEvent", () => {});
+    expect(typeof off).toBe("function");
+    off();
+    await sdk.disconnect();
+  });
+});
+
 // The full multi-tab semantics (Web Locks API steal + auto-promote)
 // are exercised by the browser-mode test harness (vitest + Playwright)
 // since the real Web Locks API isn't available in Node. The Node unit
