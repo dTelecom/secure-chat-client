@@ -11,3 +11,5 @@ test/browser/__screenshots__
 
 # Tarballs
 *.tgz
+
+.yarn

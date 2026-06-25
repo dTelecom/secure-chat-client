@@ -397,14 +397,30 @@ function toChatError(err: unknown): ChatError {
  * otherwise drainPending re-attempts it on every reconnect forever,
  * filling logs with errors that can't be acted on.
  *
- * Other Olm error variants (bad MAC, ratchet out of sync, no session
- * for normal-type) are NOT treated as terminal here: those CAN recover
- * via the SDK's existing decrypt-failure path (forgetPeerDevice +
- * refresh + retry).
+ * See also isPermanentDecryptError — normal-type ciphertext after the
+ * recovery path fails shares the same terminal outcome.
  */
 function isUnknownOtkError(err: unknown): boolean {
   if (!(err instanceof Error)) return false;
   return /unknown one-time key/i.test(err.message);
+}
+
+/**
+ * `isPermanentDecryptError` – true when an envelope's ciphertext can never be
+ * decrypted, even after the SDK's forget+refresh+retry recovery path.
+ *
+ * This covers normal-type messages whose Olm session was lost (stale/forgotten).
+ * Unlike prekey-type messages which can bootstrap a fresh inbound session,
+ * normal-type ciphertext requires an existing session with matching ratchet
+ * state. When the session is gone (e.g., deleted during recovery from a stale
+ * pickle), the envelope is permanently undecryptable.
+ *
+ * These envelopes should be HTTP-acked to clear them from the backend queue;
+ * otherwise drainPending re-attempts them on every reconnect forever.
+ */
+function isPermanentDecryptError(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  return /permanent decrypt failure: normal-type/.test(err.message);
 }
 
 /**
@@ -1568,8 +1584,14 @@ export class DTelecomSecureChat {
         .request(name, { mode: "exclusive", steal: true }, async () => {
           try {
             this.isPrimaryFlag = true;
+            this.sessions.clearCache();
+            this.sessions.clearSessionCache();
+            await this.conversations.reload();
             await this.activatePrimary();
             this.dispatch("tabConflict", { role: "primary", activeAt: Date.now() });
+            this.emitConversationsChanged(
+              this.conversations.peers(),
+            ).catch(() => {});
             resolveActive();
           } catch (err) {
             this.isPrimaryFlag = false;
@@ -1656,18 +1678,25 @@ export class DTelecomSecureChat {
             // ciphertext on every reconnect, filling logs with errors
             // that can't be acted on. See isUnknownOtkError JSDoc.
             //
+            // Two terminal families:
+            //   1. isUnknownOtkError – prekey references a consumed OTK.
+            //   2. isPermanentDecryptError – normal-type after session
+            //      stale/recovery failure; session is gone and normal-type
+            //      can't bootstrap a fresh one.
+            //
             // Transient failures (everything else) keep the envelope on
             // the queue so a future reconnect can retry — the SDK's
             // decrypt-failure recovery path (forgetPeerDevice + refresh
             // + retry inside handleInboundCiphertext) can fix some of
             // those, but if it can't, this drain attempt is a no-op.
-            if (isUnknownOtkError(err)) {
+            if (isUnknownOtkError(err) || isPermanentDecryptError(err)) {
               this.log.warn(
-                "delivery: envelope permanently undecryptable (unknown OTK), acking to clear queue",
+                "delivery: envelope permanently undecryptable, acking to clear queue",
                 {
                   envelopeUuid: env.envelopeUuid,
                   peerUserId: env.senderUserId,
                   peerDeviceId: env.senderDeviceId,
+                  reason: isUnknownOtkError(err) ? "unknown_otk" : "normal_type_session_lost",
                   err: err instanceof Error ? err.message : String(err),
                 },
               );
@@ -1797,7 +1826,20 @@ export class DTelecomSecureChat {
             opts.msgType,
           );
         } catch {
-          // Still broken — drop. Future messages from peer will re-bootstrap.
+          // Still broken after recovery. For normal-type ciphertext the
+          // envelope is permanently undecryptable — the session is gone
+          // (stale pickle that got deleted during recovery) and normal-type
+          // can't bootstrap a fresh one. Ack it to clear the queue instead
+          // of retrying forever.
+          if (opts.msgType === "normal") {
+            throw new Error(
+              "permanent decrypt failure: normal-type ciphertext cannot be recovered " +
+              `(session ${(firstErr instanceof Error && /MAC tag mismatch/i.test(firstErr.message)) ? "was stale and deleted" : "not found"}); ` +
+              `original error: ${firstErr instanceof Error ? firstErr.message : String(firstErr)}`,
+            );
+          }
+          // Prekey-type: keep the original error so drainPending retries
+          // (next reconnect the peer may have fresh OTKs).
           throw firstErr;
         }
       }

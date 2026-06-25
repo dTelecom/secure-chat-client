@@ -99,4 +99,11 @@ export interface CryptoAdapter {
 
   /** Whether a session exists with this peer device. */
   hasSession(peerUserId: string, peerDeviceId: string): Promise<boolean>;
+
+  /**
+   * Drop all in-memory Olm sessions. On next encrypt/decrypt, sessions are
+   * reloaded fresh from the KV store. Called on primary-tab steal so a
+   * newly promoted primary doesn't use stale ratchet state.
+   */
+  clearSessionCache(): void;
 }

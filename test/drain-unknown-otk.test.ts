@@ -6,6 +6,11 @@
 //
 // Other decrypt errors (bad MAC, no session, etc.) keep the existing
 // "leave on queue, retry next reconnect" behavior — those can recover.
+//
+// 0.14.1 — adds a second terminal family: normal-type ciphertext whose
+// session is lost can never be decrypted (unlike prekey-type it can't
+// bootstrap a fresh inbound session), so after the forget+refresh+retry
+// recovery path fails it is acked rather than retried forever.
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { DTelecomSecureChat } from "../src/index.js";
@@ -112,6 +117,7 @@ class ThrowOnDecryptAdapter implements CryptoAdapter {
   }
   forgetSession(p: string, d: string): Promise<void> { return this.delegate.forgetSession(p, d); }
   hasSession(p: string, d: string): Promise<boolean> { return this.delegate.hasSession(p, d); }
+  clearSessionCache(): void { this.delegate.clearSessionCache(); }
 }
 
 async function connectAlice(crypto: CryptoAdapter, fetchImpl: typeof fetch) {
@@ -132,6 +138,19 @@ const STUCK_ENVELOPE = {
   senderDeviceId: "bob-dev-1",
   ciphertext: "AAAA",
   msgType: "prekey" as const,
+  receivedAt: 0,
+};
+
+// Normal-type counterpart: a normal-type ciphertext whose Olm session is
+// gone can never be decrypted (it can't bootstrap a fresh inbound session
+// the way a prekey can), so after the SDK's forget+refresh+retry recovery
+// fails it is permanently undecryptable and must be acked.
+const STUCK_NORMAL_ENVELOPE = {
+  envelopeUuid: "stuck-normal-1",
+  senderUserId: "bob",
+  senderDeviceId: "bob-dev-1",
+  ciphertext: "BBBB",
+  msgType: "normal" as const,
   receivedAt: 0,
 };
 
@@ -173,6 +192,46 @@ describe("drainPending — terminal vs transient decrypt failures", () => {
     // returns from the inner loop without acking if nothing succeeded.
     const totalAcked = ackCalls.flat();
     expect(totalAcked).toEqual([]);
+
+    await sdk.disconnect();
+  });
+
+  it("normal-type decrypt failure (session lost) → HTTP-acked after recovery fails", async () => {
+    // A normal-type envelope whose session is gone fails the first decrypt,
+    // fails again after the SDK's forget+refresh+retry recovery, and is then
+    // surfaced as a permanent decrypt failure → acked to clear the queue.
+    const ackCalls: string[][] = [];
+    const fetchImpl = makeMockFetch({
+      initialPending: [STUCK_NORMAL_ENVELOPE],
+      ackCalls,
+    });
+    // A MAC mismatch on a normal-type message means the ratchet state is
+    // unrecoverable. Any decrypt error is terminal for normal-type.
+    const crypto = new ThrowOnDecryptAdapter("OLM.MAC tag mismatch");
+    const sdk = await connectAlice(crypto, fetchImpl);
+
+    await new Promise((r) => setTimeout(r, 100));
+
+    expect(ackCalls.flat()).toEqual(["stuck-normal-1"]);
+
+    await sdk.disconnect();
+  });
+
+  it("prekey-type decrypt failure (non-OTK) → NOT acked, stays on queue", async () => {
+    // The mirror of the normal-type case: a prekey-type message that fails
+    // for a non-OTK reason is transient — a future reconnect may succeed by
+    // bootstrapping a fresh inbound session, so it must NOT be acked.
+    const ackCalls: string[][] = [];
+    const fetchImpl = makeMockFetch({
+      initialPending: [STUCK_ENVELOPE],
+      ackCalls,
+    });
+    const crypto = new ThrowOnDecryptAdapter("OLM.MAC tag mismatch");
+    const sdk = await connectAlice(crypto, fetchImpl);
+
+    await new Promise((r) => setTimeout(r, 100));
+
+    expect(ackCalls.flat()).toEqual([]);
 
     await sdk.disconnect();
   });

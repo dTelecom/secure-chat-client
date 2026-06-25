@@ -1,6 +1,6 @@
 {
   "name": "@dtelecom/secure-chat-client",
-  "version": "0.14.0",
+  "version": "0.14.1",
   "description": "TypeScript SDK for dTelecom secure 1:1 chat (E2E via Olm/vodozemac, fanout multi-device).",
   "type": "module",
   "main": "dist/index.cjs",
@@ -88,11 +88,12 @@
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
-    "@vitest/browser": "^3.2.4",
+    "@vitest/browser": "^3.2.6",
     "playwright": "^1.59.1",
     "tsup": "^8.0.0",
     "tsx": "^4.7.0",
     "typescript": "^5.7.0",
-    "vitest": "^3.0.0"
-  }
+    "vitest": "^3.2.6"
+  },
+  "packageManager": "yarn@4.14.1"
 }

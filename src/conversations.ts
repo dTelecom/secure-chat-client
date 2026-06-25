@@ -70,6 +70,9 @@ export class ConversationIndex {
   /**
    * Bulk-load the index from KV. Idempotent. Called from `connect()` so the
    * frontend's first `listConversations()` is sync against the cache.
+   *
+   * Use `reload()` (new in 0.14.1) to force a re-read from KV — e.g. after a
+   * primary-tab steal where another tab may have updated the persisted rows.
    */
   async load(): Promise<void> {
     if (this.loaded) return;
@@ -186,6 +189,17 @@ export class ConversationIndex {
   }
 
   /**
+   * Force a full re-read from KV. Resets the `loaded` flag and re-loads
+   * all rows. Use after a primary-tab steal so the promoted tab sees
+   * conversations persisted by the previous primary.
+   */
+  async reload(): Promise<void> {
+    this.cache.clear();
+    this.loaded = false;
+    await this.load();
+  }
+
+  /**
    * Return all conversations, sorted by lastMessageAt DESC (most recent
    * first). Joins each row with the latest message snapshot from
    * MessageStore and computes the unread count.
@@ -229,6 +243,11 @@ export class ConversationIndex {
     }
     out.sort((a, b) => b.lastMessageAt - a.lastMessageAt);
     return out;
+  }
+
+  /** Return all peer user IDs currently in the cache. */
+  peers(): string[] {
+    return Array.from(this.cache.keys());
   }
 
   /** Test/internal accessor — returns the raw cached row. */

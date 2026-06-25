@@ -202,6 +202,24 @@ export class SessionManager {
     await this.opts.crypto.forgetSession(peerUserId, peerDeviceId);
   }
 
+  /** Clear all in-memory caches. Called on primary steal so a newly
+   *  activated primary doesn't operate on stale peer bundles etc. */
+  clearCache(): void {
+    this.bundleCache.clear();
+    this.inflightRefresh.clear();
+    this.inflightDiscovery.clear();
+    this.pendingCatchUp.clear();
+    this.lastDiscoveryAt.clear();
+    this.emptyCacheUntil.clear();
+    this.locks.clear();
+  }
+
+  /** Drop all in-memory Olm sessions. Delegates to the crypto adapter so
+   *  the next encrypt/decrypt reloads from the KV store. */
+  clearSessionCache(): void {
+    this.opts.crypto.clearSessionCache();
+  }
+
   /** Test/diagnostic helper. */
   async hasSession(peerUserId: string, peerDeviceId: string): Promise<boolean> {
     return this.opts.crypto.hasSession(peerUserId, peerDeviceId);
@@ -216,17 +234,23 @@ export class SessionManager {
     inflightClaimAll: string[];
     inflightDiscovery: string[];
   } {
-    const bundleCache = Array.from(this.bundleCache.entries()).map(([peerUserId, devices]) => {
-      const cooldown = this.emptyCacheUntil.get(peerUserId);
-      const entry: { peerUserId: string; deviceCount: number; emptyCooldownExpiresAt?: number } = {
-        peerUserId,
-        deviceCount: devices.length,
-      };
-      if (cooldown !== undefined && cooldown > Date.now()) {
-        entry.emptyCooldownExpiresAt = cooldown;
-      }
-      return entry;
-    });
+    const bundleCache = Array.from(this.bundleCache.entries()).map(
+      ([peerUserId, devices]) => {
+        const cooldown = this.emptyCacheUntil.get(peerUserId);
+        const entry: {
+          peerUserId: string;
+          deviceCount: number;
+          emptyCooldownExpiresAt?: number;
+        } = {
+          peerUserId,
+          deviceCount: devices.length,
+        };
+        if (cooldown !== undefined && cooldown > Date.now()) {
+          entry.emptyCooldownExpiresAt = cooldown;
+        }
+        return entry;
+      },
+    );
     return {
       bundleCache,
       inflightClaimAll: Array.from(this.inflightRefresh.keys()),

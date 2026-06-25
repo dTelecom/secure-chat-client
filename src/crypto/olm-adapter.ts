@@ -197,6 +197,10 @@ export class OlmCryptoAdapter implements CryptoAdapter {
     await this.opts.store.delete(OLM_SESSION_PREFIX + key);
   }
 
+  clearSessionCache(): void {
+    this.sessions.clear();
+  }
+
   async hasSession(peerUserId: string, peerDeviceId: string): Promise<boolean> {
     if (this.sessions.has(sessionKey(peerUserId, peerDeviceId))) return true;
     const persisted = await this.opts.store.getString(
