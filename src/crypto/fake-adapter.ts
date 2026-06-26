@@ -108,6 +108,10 @@ export class FakeCryptoAdapter implements CryptoAdapter {
     this.sessions.delete(sessionKey(peerUserId, peerDeviceId));
   }
 
+  clearSessionCache(): void {
+    this.sessions.clear();
+  }
+
   async hasSession(peerUserId: string, peerDeviceId: string): Promise<boolean> {
     return this.sessions.has(sessionKey(peerUserId, peerDeviceId));
   }

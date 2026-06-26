@@ -112,6 +112,7 @@ class ThrowOnDecryptAdapter implements CryptoAdapter {
   }
   forgetSession(p: string, d: string): Promise<void> { return this.delegate.forgetSession(p, d); }
   hasSession(p: string, d: string): Promise<boolean> { return this.delegate.hasSession(p, d); }
+  clearSessionCache(): void { this.delegate.clearSessionCache(); }
 }
 
 async function connectAlice(crypto: CryptoAdapter, fetchImpl: typeof fetch) {

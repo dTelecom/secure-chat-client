@@ -231,6 +231,24 @@ export class ConversationIndex {
     return out;
   }
 
+  /**
+   * Force a full re-read from KV. Resets the `loaded` flag and re-loads all
+   * rows. Called on primary-tab promotion so the promoted tab sees
+   * conversations another tab of the same device persisted while we were
+   * secondary.
+   */
+  async reload(): Promise<void> {
+    this.cache.clear();
+    this.loaded = false;
+    await this.load();
+  }
+
+  /** Peer user IDs currently in the cache (e.g. to emit conversationsChanged
+   *  after a reload). */
+  peers(): string[] {
+    return Array.from(this.cache.keys());
+  }
+
   /** Test/internal accessor — returns the raw cached row. */
   peek(peerUserId: string): ConvIndexRow | undefined {
     return this.cache.get(peerUserId);

@@ -202,6 +202,31 @@ export class SessionManager {
     await this.opts.crypto.forgetSession(peerUserId, peerDeviceId);
   }
 
+  /**
+   * Drop all in-memory peer-bundle / discovery caches. Called when a tab is
+   * promoted to primary: another tab of the same device may have refreshed
+   * bundles or advanced discovery while we were secondary, so we re-read
+   * everything lazily rather than trust possibly-stale entries.
+   */
+  clearCache(): void {
+    this.bundleCache.clear();
+    this.inflightRefresh.clear();
+    this.inflightDiscovery.clear();
+    this.pendingCatchUp.clear();
+    this.lastDiscoveryAt.clear();
+    this.emptyCacheUntil.clear();
+    this.locks.clear();
+  }
+
+  /**
+   * Drop all in-memory Olm sessions (delegates to the crypto adapter). The
+   * next encrypt/decrypt reloads each session from the persisted KV store.
+   * Called on primary-tab promotion so we never ratchet from a stale fork.
+   */
+  clearSessionCache(): void {
+    this.opts.crypto.clearSessionCache();
+  }
+
   /** Test/diagnostic helper. */
   async hasSession(peerUserId: string, peerDeviceId: string): Promise<boolean> {
     return this.opts.crypto.hasSession(peerUserId, peerDeviceId);

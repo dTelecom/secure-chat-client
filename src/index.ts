@@ -1463,6 +1463,26 @@ export class DTelecomSecureChat {
   }
 
   /**
+   * Drop every in-memory cache that another tab of the SAME device may have
+   * mutated while we were secondary, then re-read from KV. MUST run on every
+   * promotion to primary — both the explicit `takeOver()` steal path
+   * (`stealAndActivate`) AND the automatic background promotion that fires
+   * when the previous primary disconnects (`armBackgroundLockWait`).
+   *
+   * Two tabs are one device sharing one Olm account + sessions on disk, but
+   * each tab keeps its OWN in-memory `Map` of Olm `Session` objects. A
+   * re-promoted tab that kept its stale in-memory ratchet would encrypt from
+   * a position the peer has already advanced past — the peer can't decrypt,
+   * forgets the session, and the conversation deadlocks. Reloading session
+   * (and bundle / conversation) state from KV here is the root-cause fix.
+   */
+  private async refreshSharedStateForPromotion(): Promise<void> {
+    this.sessions.clearCache();
+    this.sessions.clearSessionCache();
+    await this.conversations.reload();
+  }
+
+  /**
    * Primary-side activation. Uploads the device's bundle (if not already
    * present), connects the WS, and lets `onWsState("open")` drive the
    * drainPending / topup / refresh-self-bundles flow. Idempotent — safe to
@@ -1539,8 +1559,10 @@ export class DTelecomSecureChat {
         if (!this.isPrimaryFlag) {
           this.isPrimaryFlag = true;
           try {
+            await this.refreshSharedStateForPromotion();
             await this.activatePrimary();
             this.dispatch("tabConflict", { role: "primary", activeAt: Date.now() });
+            this.emitConversationsChanged(this.conversations.peers()).catch(() => {});
           } catch {
             // Activation failed; demote back so we stay consistent.
             this.isPrimaryFlag = false;
@@ -1568,8 +1590,10 @@ export class DTelecomSecureChat {
         .request(name, { mode: "exclusive", steal: true }, async () => {
           try {
             this.isPrimaryFlag = true;
+            await this.refreshSharedStateForPromotion();
             await this.activatePrimary();
             this.dispatch("tabConflict", { role: "primary", activeAt: Date.now() });
+            this.emitConversationsChanged(this.conversations.peers()).catch(() => {});
             resolveActive();
           } catch (err) {
             this.isPrimaryFlag = false;
