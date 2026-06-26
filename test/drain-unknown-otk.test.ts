@@ -120,6 +120,39 @@ class ThrowOnDecryptAdapter implements CryptoAdapter {
   clearSessionCache(): void { this.delegate.clearSessionCache(); }
 }
 
+/**
+ * Crypto adapter that throws a raw STRING (not an Error) on decrypt.
+ *
+ * This mirrors the real `@dtelecom/vodozemac-wasm` binding: its wasm-bindgen
+ * build has no `__wbindgen_error_new` import, so a failed createInboundSession
+ * throws the Rust Display string directly (`throw takeFromExternrefTable0(...)`)
+ * — a JS string, NOT an Error instance. Regression guard for the production
+ * bug where `isUnknownOtkError`'s `instanceof Error` check returned false for
+ * these throwables and the envelope looped forever instead of being acked.
+ */
+class ThrowStringOnDecryptAdapter implements CryptoAdapter {
+  private delegate = new FakeCryptoAdapter();
+  constructor(private errMessage: string) {}
+  init(): Promise<void> { return this.delegate.init(); }
+  hasAccount(): Promise<boolean> { return this.delegate.hasAccount(); }
+  generateAccount(n: number): Promise<UploadBundle> { return this.delegate.generateAccount(n); }
+  getCurrentBundle(): Promise<UploadBundle> { return this.delegate.getCurrentBundle(); }
+  generateOneTimeKeys(n: number): Promise<{ id: string; public: string }[]> {
+    return this.delegate.generateOneTimeKeys(n);
+  }
+  unusedOneTimeKeyCount(): Promise<number> { return this.delegate.unusedOneTimeKeyCount(); }
+  encryptForPeer(p: string, d: string, b: ClaimedDevice, plain: string): Promise<OutboundEnvelope> {
+    return this.delegate.encryptForPeer(p, d, b, plain);
+  }
+  async decryptFromPeer(): Promise<string> {
+    // eslint-disable-next-line @typescript-eslint/no-throw-literal
+    throw this.errMessage;
+  }
+  forgetSession(p: string, d: string): Promise<void> { return this.delegate.forgetSession(p, d); }
+  hasSession(p: string, d: string): Promise<boolean> { return this.delegate.hasSession(p, d); }
+  clearSessionCache(): void { this.delegate.clearSessionCache(); }
+}
+
 async function connectAlice(crypto: CryptoAdapter, fetchImpl: typeof fetch) {
   return DTelecomSecureChat.connect({
     apiBaseURL: "http://test",
@@ -232,6 +265,46 @@ describe("drainPending — terminal vs transient decrypt failures", () => {
     await new Promise((r) => setTimeout(r, 100));
 
     expect(ackCalls.flat()).toEqual([]);
+
+    await sdk.disconnect();
+  });
+
+  it("vodozemac string throwable (not Error) 'unknown one-time key' → HTTP-acked", async () => {
+    // Regression: the real WASM binding throws a raw string, not an Error.
+    // Before the fix, isUnknownOtkError's `instanceof Error` guard returned
+    // false for this, so the envelope was retried on every reconnect forever
+    // instead of being acked — clogging the drain and starving live events.
+    const ackCalls: string[][] = [];
+    const fetchImpl = makeMockFetch({
+      initialPending: [STUCK_ENVELOPE],
+      ackCalls,
+    });
+    const crypto = new ThrowStringOnDecryptAdapter(
+      "The pre-key message contained an unknown one-time key: uoeaKk5hJS3aIcBv/46qP9sAwiWYH2KwYiq32FLYnz8",
+    );
+    const sdk = await connectAlice(crypto, fetchImpl);
+
+    await new Promise((r) => setTimeout(r, 100));
+
+    expect(ackCalls.length).toBe(1);
+    expect(ackCalls[0]).toEqual(["stuck-uuid-1"]);
+
+    await sdk.disconnect();
+  });
+
+  it("vodozemac string throwable normal-type (session lost) → HTTP-acked after recovery", async () => {
+    // The normal-type counterpart, also as a raw string throwable.
+    const ackCalls: string[][] = [];
+    const fetchImpl = makeMockFetch({
+      initialPending: [STUCK_NORMAL_ENVELOPE],
+      ackCalls,
+    });
+    const crypto = new ThrowStringOnDecryptAdapter("OLM.MAC tag mismatch");
+    const sdk = await connectAlice(crypto, fetchImpl);
+
+    await new Promise((r) => setTimeout(r, 100));
+
+    expect(ackCalls.flat()).toEqual(["stuck-normal-1"]);
 
     await sdk.disconnect();
   });

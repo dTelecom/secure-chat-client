@@ -386,6 +386,32 @@ function toChatError(err: unknown): ChatError {
 }
 
 /**
+ * Extract a human-readable message from any thrown value.
+ *
+ * CRITICAL: the vodozemac WASM binding does NOT throw `Error` instances.
+ * Its wasm-bindgen build has no `__wbindgen_error_new` import, so a failed
+ * `Account.createInboundSession` / `Session.decrypt` throws the Rust error's
+ * Display string as a raw JS **string** (`throw takeFromExternrefTable0(...)`).
+ *
+ * Earlier error classifiers guarded on `err instanceof Error` and read
+ * `err.message`, which is `false`/`undefined` for these string throwables —
+ * so a permanently-undecryptable prekey ("unknown one-time key") was
+ * misclassified as transient and retried on every reconnect FOREVER,
+ * clogging the drain queue and starving live app-event delivery. This
+ * helper normalizes Error, string, and `{ message }`-shaped throwables so
+ * the classifiers below work against the real WASM error shape.
+ */
+function errorText(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  if (typeof err === "string") return err;
+  if (err && typeof err === "object") {
+    const m = (err as { message?: unknown }).message;
+    if (typeof m === "string") return m;
+  }
+  return String(err);
+}
+
+/**
  * Detects vodozemac's "unknown one-time key" error message thrown by
  * `Account.createInboundSession` when the prekey-message references an
  * OTK that no longer exists in our local Account's pool.
@@ -397,12 +423,14 @@ function toChatError(err: unknown): ChatError {
  * otherwise drainPending re-attempts it on every reconnect forever,
  * filling logs with errors that can't be acted on.
  *
+ * Accepts any throwable shape (see errorText) — vodozemac throws raw
+ * strings, not Error instances.
+ *
  * See also isPermanentDecryptError — normal-type ciphertext after the
  * recovery path fails shares the same terminal outcome.
  */
 function isUnknownOtkError(err: unknown): boolean {
-  if (!(err instanceof Error)) return false;
-  return /unknown one-time key/i.test(err.message);
+  return /unknown one-time key/i.test(errorText(err));
 }
 
 /**
@@ -419,8 +447,7 @@ function isUnknownOtkError(err: unknown): boolean {
  * otherwise drainPending re-attempts them on every reconnect forever.
  */
 function isPermanentDecryptError(err: unknown): boolean {
-  if (!(err instanceof Error)) return false;
-  return /permanent decrypt failure: normal-type/.test(err.message);
+  return /permanent decrypt failure: normal-type/.test(errorText(err));
 }
 
 /**
@@ -1832,10 +1859,11 @@ export class DTelecomSecureChat {
           // can't bootstrap a fresh one. Ack it to clear the queue instead
           // of retrying forever.
           if (opts.msgType === "normal") {
+            const firstErrText = errorText(firstErr);
             throw new Error(
               "permanent decrypt failure: normal-type ciphertext cannot be recovered " +
-              `(session ${(firstErr instanceof Error && /MAC tag mismatch/i.test(firstErr.message)) ? "was stale and deleted" : "not found"}); ` +
-              `original error: ${firstErr instanceof Error ? firstErr.message : String(firstErr)}`,
+              `(session ${/MAC tag mismatch/i.test(firstErrText) ? "was stale and deleted" : "not found"}); ` +
+              `original error: ${firstErrText}`,
             );
           }
           // Prekey-type: keep the original error so drainPending retries
